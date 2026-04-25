@@ -3,6 +3,7 @@ import MainView from '../views/MainView.vue'
 import HomeView from '../views/HomeView.vue'
 import VideoMonitor from '../components/VideoMonitor.vue'
 import LoginView from '../views/LoginView.vue'
+import SystemSettingsView from '../views/SystemSettingsView.vue'
 import axios from 'axios'
 
 const routes = [
@@ -40,6 +41,12 @@ const routes = [
     path: '/monitor',
     name: 'Monitor',
     component: VideoMonitor,
+    meta: { requiresAuth: true }
+  },
+  {
+    path: '/system-settings/:tab?',
+    name: 'SystemSettings',
+    component: SystemSettingsView,
     meta: { requiresAuth: true }
   }
 ]

@@ -101,6 +101,7 @@
               <div class="tab-content">
                 <ConfigPanel
                   :alarm-api-prefix="alarmApiPrefix"
+                  :visible-tabs="['model', 'video', 'classes', 'display', 'occlusion', 'mqtt', 'alarm']"
                   @model-changed="handleModelChanged"
                   @video-changed="handleVideoChanged"
                   @classes-changed="handleClassesChanged"

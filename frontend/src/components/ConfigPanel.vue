@@ -2,7 +2,7 @@
   <div class="config-panel">
     <el-tabs v-model="activeTab" type="border-card">
       <!-- 模型配置 -->
-      <el-tab-pane label="模型配置" name="model">
+      <el-tab-pane v-if="isTabVisible('model')" label="模型配置" name="model">
         <el-form :model="modelForm" label-width="120px">
           <el-form-item label="检测模型">
             <el-select v-model="modelForm.model" placeholder="加载中..." style="width: 100%">
@@ -70,7 +70,7 @@
       </el-tab-pane>
 
       <!-- 视频配置 -->
-      <el-tab-pane label="视频配置" name="video">
+      <el-tab-pane v-if="isTabVisible('video')" label="视频配置" name="video">
         <el-form :model="videoForm" label-width="120px">
           <el-form-item label="视频URL">
             <el-input v-model="videoForm.video_url" placeholder="rtsp://..." />
@@ -125,7 +125,7 @@
       </el-tab-pane>
 
       <!-- 类别配置 -->
-      <el-tab-pane label="检测类别" name="classes">
+      <el-tab-pane v-if="isTabVisible('classes')" label="检测类别" name="classes">
         <div class="classes-controls">
           <el-button size="small" @click="selectAllClasses">全选</el-button>
           <el-button size="small" @click="deselectAllClasses">全不选</el-button>
@@ -170,7 +170,7 @@
       </el-tab-pane>
 
       <!-- 显示配置 -->
-      <el-tab-pane label="显示设置" name="display">
+      <el-tab-pane v-if="isTabVisible('display')" label="显示设置" name="display">
         <el-form :model="displayForm" label-width="120px">
           <el-form-item label="字体大小">
             <el-input-number v-model="displayForm.font_size" :min="8" :max="72" />
@@ -240,7 +240,7 @@
       </el-tab-pane>
 
       <!-- 登录设置 -->
-      <el-tab-pane label="登录设置" name="login">
+      <el-tab-pane v-if="isTabVisible('login')" label="登录设置" name="login">
         <el-form :model="loginForm" label-width="150px">
           <el-form-item label="用户名">
             <el-input
@@ -280,7 +280,7 @@
       </el-tab-pane>
 
       <!-- 遮挡检测配置 -->
-      <el-tab-pane label="遮挡检测" name="occlusion">
+      <el-tab-pane v-if="isTabVisible('occlusion')" label="遮挡检测" name="occlusion">
         <el-form :model="occlusionForm" label-width="150px">
           <el-form-item label="启用遮挡检测">
             <el-switch v-model="occlusionForm.enabled" />
@@ -319,7 +319,7 @@
       </el-tab-pane>
 
       <!-- MQTT配置 -->
-      <el-tab-pane label="MQTT设置" name="mqtt">
+      <el-tab-pane v-if="isTabVisible('mqtt')" label="MQTT设置" name="mqtt">
         <el-form :model="mqttForm" label-width="150px">
           <el-form-item label="启用MQTT">
             <el-switch v-model="mqttForm.enabled" />
@@ -380,7 +380,7 @@
       </el-tab-pane>
 
       <!-- 报警配置 -->
-      <el-tab-pane label="报警设置" name="alarm">
+      <el-tab-pane v-if="isTabVisible('alarm')" label="报警设置" name="alarm">
         <el-form :model="alarmForm" label-width="150px">
           <el-form-item label="防抖时间（秒）">
             <el-input-number
@@ -459,7 +459,7 @@
       </el-tab-pane>
 
       <!-- 系统 -->
-      <el-tab-pane label="系统" name="system">
+      <el-tab-pane v-if="isTabVisible('system')" label="系统" name="system">
         <el-form label-width="120px">
           <el-form-item label="重启服务">
             <el-button type="warning" @click="confirmRestart" :loading="restartLoading">
@@ -485,12 +485,28 @@ const props = defineProps({
   alarmApiPrefix: {
     type: String,
     default: '/api'
+  },
+  initialTab: {
+    type: String,
+    default: 'model'
+  },
+  visibleTabs: {
+    type: Array,
+    default: () => ['model', 'video', 'classes', 'display', 'login', 'occlusion', 'mqtt', 'alarm', 'system']
   }
 })
 
 const emit = defineEmits(['model-changed', 'video-changed', 'classes-changed', 'display-changed', 'alarm-changed'])
 
 const activeTab = ref('model')
+const isTabVisible = (tabName) => props.visibleTabs.includes(tabName)
+
+const resolveActiveTab = (preferredTab) => {
+  if (isTabVisible(preferredTab)) {
+    return preferredTab
+  }
+  return props.visibleTabs[0] || 'model'
+}
 const models = ref([])
 const classesData = ref([])
 const enabledClasses = ref([])
@@ -695,6 +711,14 @@ watch(() => props.alarmApiPrefix, () => {
   loadModels()
   loadAlarmConfig()
 })
+
+watch(
+  () => [props.initialTab, props.visibleTabs],
+  () => {
+    activeTab.value = resolveActiveTab(props.initialTab)
+  },
+  { immediate: true, deep: true }
+)
 
 const loadModels = async () => {
   try {
@@ -1376,7 +1400,7 @@ const applyLogin = async () => {
 // 提示：部分设置需重启服务后生效
 const showRestartHint = () => {
   ElMessage.success({
-    message: '设置已保存。重启服务后才能完全生效，请到「系统」页点击「重启服务」。',
+    message: '设置已保存。重启服务后才能完全生效，请到「系统设置」中点击「重启系统」。',
     duration: 5000,
     showClose: true
   })
