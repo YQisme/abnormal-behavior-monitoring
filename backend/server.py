@@ -1411,8 +1411,9 @@ def detection_worker():
             
             # 检测对象是否进入任何启用的区域
             enabled_zones = [z for z in zones if z.get('enabled', True) and len(z.get('points', [])) >= 3]
+            no_zone_mode = len(enabled_zones) == 0  # 未配置区域时，默认全画面检测
             person_in_zone_this_frame = False
-            if enabled_zones:
+            if enabled_zones or no_zone_mode:
                 if results.boxes is not None and len(results.boxes) > 0:
                     boxes = results.boxes
                     track_ids = results.boxes.id
@@ -1431,29 +1432,36 @@ def detection_worker():
                                     x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
                                     bbox_center = [(x1 + x2) / 2, (y1 + y2) / 2]
                                     
-                                    # 检测是否进入任何启用的区域
-                                    detection_mode = alarm_config.get('detection_mode', 'center')
-                                    for zone in enabled_zones:
-                                        zone_points = zone.get('points', [])
-                                        if len(zone_points) < 3:
-                                            continue
-                                        
+                                    # 检测是否进入区域：无区域时默认全画面为区域
                                     in_zone = False
-                                    if detection_mode == 'center':
-                                        # 中心点模式：检查中心点是否在多边形内
-                                        in_zone = is_point_in_polygon(bbox_center, zone_points)
-                                    elif detection_mode == 'edge':
-                                        # 边框任意点模式：检查检测框是否与多边形有交集
-                                        in_zone = is_bbox_in_polygon([x1, y1, x2, y2], zone_points)
+                                    zone_id = 'full_frame'
+                                    zone_name = '当前区域'
+                                    if no_zone_mode:
+                                        in_zone = True
+                                    else:
+                                        detection_mode = alarm_config.get('detection_mode', 'center')
+                                        for zone in enabled_zones:
+                                            zone_points = zone.get('points', [])
+                                            if len(zone_points) < 3:
+                                                continue
+                                            if detection_mode == 'center':
+                                                # 中心点模式：检查中心点是否在多边形内
+                                                in_zone = is_point_in_polygon(bbox_center, zone_points)
+                                            elif detection_mode == 'edge':
+                                                # 边框任意点模式：检查检测框是否与多边形有交集
+                                                in_zone = is_bbox_in_polygon([x1, y1, x2, y2], zone_points)
+                                            if in_zone:
+                                                zone_id = zone.get('id', 'unknown')
+                                                zone_name = zone.get('name', '未知区域')
+                                                break
                                     
                                     if in_zone:
                                         person_in_zone_this_frame = True
                                         track_id = int(track_ids[i])
                                         class_name_cn = get_class_name_cn(cls_id)
-                                        zone_id = zone.get('id', 'unknown')
-                                        zone_name = zone.get('name', '未知区域')
                                         trigger_alarm(track_id, bbox_center, zone_id, zone_name, cls_id, class_name_cn)
-                                        break  # 只对第一个匹配的区域报警
+                                        if not no_zone_mode:
+                                            break  # 区域模式下只对第一个匹配的区域报警
                 # 本帧无人进入任何区域且此前已发送过 hasPeople:1 时，发送恢复消息
                 if not person_in_zone_this_frame and zone_has_people_mqtt_sent:
                     send_mqtt_message({"hasPeople": 0})
@@ -1484,7 +1492,9 @@ def detection_worker():
                                 # 判断是否在任何一个启用的报警区域内
                                 in_zone = False
                                 enabled_zones = [z for z in zones if z.get('enabled', True) and len(z.get('points', [])) >= 3]
-                                if enabled_zones:
+                                if not enabled_zones:
+                                    in_zone = True  # 无区域时全画面视为在区
+                                elif enabled_zones:
                                     detection_mode = alarm_config.get('detection_mode', 'center')
                                     for zone in enabled_zones:
                                         zone_points = zone.get('points', [])
@@ -1697,7 +1707,10 @@ def detection_worker():
                                 in_zone = False
                                 zone_id = None
                                 enabled_zones = [z for z in zones if z.get('enabled', True) and len(z.get('points', [])) >= 3]
-                                if enabled_zones:
+                                if not enabled_zones:
+                                    in_zone = True
+                                    zone_id = 'full_frame'
+                                elif enabled_zones:
                                     detection_mode = alarm_config.get('detection_mode', 'center')
                                     for zone in enabled_zones:
                                         zone_points = zone.get('points', [])
