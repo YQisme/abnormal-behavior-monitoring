@@ -162,6 +162,32 @@ latest_frame = None  # 最新帧
 latest_results = None  # 最新检测结果
 latest_annotated_frame = None  # 最新处理后的帧（包含YOLO检测结果和区域绘制）
 
+# 检测配置档案（用于“区域报警/离岗监测”两套独立配置）
+DETECTION_PROFILE_ZONE = "zone_alarm"
+DETECTION_PROFILE_OFFPOST = "offpost_monitor"
+DETECTION_PROFILE_FILES = {
+    DETECTION_PROFILE_ZONE: {
+        "zones": zones_config_file,
+        "alarm": alarm_config_file
+    },
+    DETECTION_PROFILE_OFFPOST: {
+        "zones": os.path.join(CONFIG_DIR, "offpost_zones_config.json"),
+        "alarm": os.path.join(CONFIG_DIR, "offpost_alarm_config.json")
+    }
+}
+current_detection_profile = DETECTION_PROFILE_ZONE
+model_profile_config_file = os.path.join(CONFIG_DIR, "model_profile_config.json")
+model_profile_config = {
+    DETECTION_PROFILE_ZONE: {
+        "model": "yolo26m_640_int8.engine",
+        "imgsz": 640
+    },
+    DETECTION_PROFILE_OFFPOST: {
+        "model": "yolo26m_640_int8.engine",
+        "imgsz": 640
+    }
+}
+
 # 录制相关变量
 recording_lock = threading.Lock()  # 录制锁
 is_recording = False  # 是否正在录制
@@ -437,6 +463,50 @@ def save_system_config():
     except Exception as e:
         backend_logger.error(f"保存系统配置失败: {e}")
 
+
+def load_model_profile_config():
+    """加载双档案模型配置"""
+    global model_profile_config
+    if not os.path.exists(model_profile_config_file):
+        return
+    try:
+        with open(model_profile_config_file, 'r', encoding='utf-8') as f:
+            cfg = json.load(f)
+        for profile in [DETECTION_PROFILE_ZONE, DETECTION_PROFILE_OFFPOST]:
+            profile_cfg = cfg.get(profile, {})
+            model_profile_config[profile] = {
+                "model": profile_cfg.get("model", model_profile_config[profile]["model"]),
+                "imgsz": int(profile_cfg.get("imgsz", model_profile_config[profile]["imgsz"]))
+            }
+        backend_logger.info(f"已从 {model_profile_config_file} 加载模型档案配置")
+    except Exception as e:
+        backend_logger.error(f"加载模型档案配置失败: {e}")
+
+
+def save_model_profile_config():
+    """保存双档案模型配置"""
+    try:
+        with open(model_profile_config_file, 'w', encoding='utf-8') as f:
+            json.dump(model_profile_config, f, indent=2, ensure_ascii=False)
+        backend_logger.info(f"模型档案配置已保存到 {model_profile_config_file}")
+    except Exception as e:
+        backend_logger.error(f"保存模型档案配置失败: {e}")
+
+
+def apply_model_profile(profile):
+    """应用指定档案的模型配置到当前运行时"""
+    global current_model_name, yolo_imgsz
+    profile_cfg = model_profile_config.get(profile, {})
+    model_name = profile_cfg.get("model", current_model_name)
+    imgsz_val = int(profile_cfg.get("imgsz", yolo_imgsz))
+    if imgsz_val < 32 or imgsz_val > 2048:
+        imgsz_val = 640
+    model_changed = model_name != current_model_name
+    current_model_name = model_name
+    yolo_imgsz = imgsz_val
+    if model_changed:
+        load_model()
+
 def load_model_classes(model_name):
     """加载模型对应的类别配置"""
     global model_classes, model_classes_cn
@@ -617,12 +687,25 @@ def save_display_config():
         backend_logger.error(f"保存显示配置失败: {e}")
 
 # 报警配置管理
-def load_alarm_config():
+def load_alarm_config(profile=None):
     """从配置文件加载报警配置"""
     global alarm_config
-    if os.path.exists(alarm_config_file):
+    profile = profile or current_detection_profile
+    alarm_file = DETECTION_PROFILE_FILES.get(profile, DETECTION_PROFILE_FILES[DETECTION_PROFILE_ZONE])["alarm"]
+
+    alarm_config = {
+        "debounce_time": 5.0,
+        "detection_mode": "center",
+        "once_per_id": False,
+        "save_event_video": True,
+        "save_event_image": True,
+        "event_video_duration": 10,
+        "event_save_path": os.path.join(BASE_DIR, "alarm_events")
+    }
+
+    if os.path.exists(alarm_file):
         try:
-            with open(alarm_config_file, 'r', encoding='utf-8') as f:
+            with open(alarm_file, 'r', encoding='utf-8') as f:
                 config = json.load(f)
                 if 'debounce_time' in config:
                     alarm_config['debounce_time'] = float(config['debounce_time'])
@@ -638,7 +721,7 @@ def load_alarm_config():
                     alarm_config['event_video_duration'] = int(config['event_video_duration'])
                 if 'event_save_path' in config:
                     alarm_config['event_save_path'] = config['event_save_path']
-                backend_logger.info(f"已从 {alarm_config_file} 加载报警配置")
+                backend_logger.info(f"已从 {alarm_file} 加载报警配置")
         except Exception as e:
             backend_logger.error(f"加载报警配置文件失败: {e}")
     
@@ -649,12 +732,14 @@ def load_alarm_config():
         os.makedirs(os.path.join(event_path, "videos"), exist_ok=True)
         os.makedirs(os.path.join(event_path, "images"), exist_ok=True)
 
-def save_alarm_config():
+def save_alarm_config(profile=None):
     """保存报警配置到文件"""
+    profile = profile or current_detection_profile
+    alarm_file = DETECTION_PROFILE_FILES.get(profile, DETECTION_PROFILE_FILES[DETECTION_PROFILE_ZONE])["alarm"]
     try:
-        with open(alarm_config_file, 'w', encoding='utf-8') as f:
+        with open(alarm_file, 'w', encoding='utf-8') as f:
             json.dump(alarm_config, f, indent=2, ensure_ascii=False)
-        backend_logger.info(f"报警配置已保存到 {alarm_config_file}")
+        backend_logger.info(f"报警配置已保存到 {alarm_file}")
     except Exception as e:
         backend_logger.error(f"保存报警配置失败: {e}")
 
@@ -852,6 +937,9 @@ def login_required(f):
 
 # 初始化加载配置和模型
 load_system_config()
+model_profile_config[DETECTION_PROFILE_ZONE]["model"] = current_model_name
+model_profile_config[DETECTION_PROFILE_ZONE]["imgsz"] = yolo_imgsz
+load_model_profile_config()
 load_classes_config()
 load_display_config()
 load_alarm_config()
@@ -1818,12 +1906,16 @@ def generate_processed_video_stream():
             time.sleep(0.1)
 
 
-def load_zones_config():
+def load_zones_config(profile=None):
     """从配置文件加载多区域配置"""
     global zones, next_zone_id
-    if os.path.exists(zones_config_file):
+    profile = profile or current_detection_profile
+    zones_file = DETECTION_PROFILE_FILES.get(profile, DETECTION_PROFILE_FILES[DETECTION_PROFILE_ZONE])["zones"]
+    zones = []
+    next_zone_id = 1
+    if os.path.exists(zones_file):
         try:
-            with open(zones_config_file, 'r', encoding='utf-8') as f:
+            with open(zones_file, 'r', encoding='utf-8') as f:
                 config = json.load(f)
                 zones = config.get("zones", [])
                 # 确保每个区域都有必需的字段
@@ -1844,23 +1936,43 @@ def load_zones_config():
                 if zones:
                     max_id = max([int(z.get('id', '0').split('_')[-1]) if z.get('id', '').startswith('zone_') else 0 for z in zones], default=0)
                     next_zone_id = max_id + 1
-                backend_logger.info(f"已从 {zones_config_file} 加载 {len(zones)} 个区域")
+                backend_logger.info(f"已从 {zones_file} 加载 {len(zones)} 个区域")
                 return True
         except Exception as e:
             backend_logger.error(f"加载区域配置文件失败: {e}")
     return False
 
 
-def save_zones_config():
+def save_zones_config(profile=None):
     """保存多区域配置到文件"""
     global zones
     config = {"zones": zones}
+    profile = profile or current_detection_profile
+    zones_file = DETECTION_PROFILE_FILES.get(profile, DETECTION_PROFILE_FILES[DETECTION_PROFILE_ZONE])["zones"]
     try:
-        with open(zones_config_file, 'w', encoding='utf-8') as f:
+        with open(zones_file, 'w', encoding='utf-8') as f:
             json.dump(config, f, indent=2, ensure_ascii=False)
-        backend_logger.info(f"多区域配置已保存到 {zones_config_file}")
+        backend_logger.info(f"多区域配置已保存到 {zones_file}")
     except Exception as e:
         backend_logger.error(f"保存区域配置失败: {e}")
+
+
+def ensure_detection_profile(profile):
+    """切换并加载指定检测档案配置"""
+    global current_detection_profile, alarm_triggered, zone_has_people_mqtt_sent
+
+    if profile not in DETECTION_PROFILE_FILES:
+        raise ValueError("未知检测档案")
+    if current_detection_profile == profile:
+        return
+
+    current_detection_profile = profile
+    apply_model_profile(profile)
+    load_zones_config(profile)
+    load_alarm_config(profile)
+    alarm_triggered.clear()
+    zone_has_people_mqtt_sent = False
+    backend_logger.info(f"检测档案已切换: {profile}")
 
 
 # 加载已保存的区域配置
@@ -2038,8 +2150,11 @@ def index():
 
 # REST API 路由 - 多区域管理
 @app.route('/api/zones', methods=['GET'])
+@app.route('/api/offpost/zones', methods=['GET'])
 def get_zones():
     """获取所有区域"""
+    profile = DETECTION_PROFILE_OFFPOST if request.path.startswith('/api/offpost/') else DETECTION_PROFILE_ZONE
+    ensure_detection_profile(profile)
     return jsonify({
         "zones": zones,
         "count": len(zones)
@@ -2047,9 +2162,12 @@ def get_zones():
 
 
 @app.route('/api/zones', methods=['POST'])
+@app.route('/api/offpost/zones', methods=['POST'])
 def create_zone():
     """创建新区域"""
     global zones, next_zone_id
+    profile = DETECTION_PROFILE_OFFPOST if request.path.startswith('/api/offpost/') else DETECTION_PROFILE_ZONE
+    ensure_detection_profile(profile)
     
     data = request.json
     points = data.get('points', [])
@@ -2086,8 +2204,11 @@ def create_zone():
 
 
 @app.route('/api/zones/<zone_id>', methods=['GET'])
+@app.route('/api/offpost/zones/<zone_id>', methods=['GET'])
 def get_zone(zone_id):
     """获取指定区域"""
+    profile = DETECTION_PROFILE_OFFPOST if request.path.startswith('/api/offpost/') else DETECTION_PROFILE_ZONE
+    ensure_detection_profile(profile)
     zone = next((z for z in zones if z.get('id') == zone_id), None)
     if zone:
         return jsonify({"success": True, "zone": zone})
@@ -2096,9 +2217,12 @@ def get_zone(zone_id):
 
 
 @app.route('/api/zones/<zone_id>', methods=['PUT'])
+@app.route('/api/offpost/zones/<zone_id>', methods=['PUT'])
 def update_zone(zone_id):
     """更新区域"""
     global zones
+    profile = DETECTION_PROFILE_OFFPOST if request.path.startswith('/api/offpost/') else DETECTION_PROFILE_ZONE
+    ensure_detection_profile(profile)
     
     zone = next((z for z in zones if z.get('id') == zone_id), None)
     if not zone:
@@ -2129,9 +2253,12 @@ def update_zone(zone_id):
 
 
 @app.route('/api/zones/<zone_id>', methods=['DELETE'])
+@app.route('/api/offpost/zones/<zone_id>', methods=['DELETE'])
 def delete_zone(zone_id):
     """删除区域"""
     global zones, alarm_triggered
+    profile = DETECTION_PROFILE_OFFPOST if request.path.startswith('/api/offpost/') else DETECTION_PROFILE_ZONE
+    ensure_detection_profile(profile)
     
     zone = next((z for z in zones if z.get('id') == zone_id), None)
     if not zone:
@@ -2151,9 +2278,12 @@ def delete_zone(zone_id):
 
 
 @app.route('/api/zones/<zone_id>/rename', methods=['POST'])
+@app.route('/api/offpost/zones/<zone_id>/rename', methods=['POST'])
 def rename_zone(zone_id):
     """重命名区域"""
     global zones
+    profile = DETECTION_PROFILE_OFFPOST if request.path.startswith('/api/offpost/') else DETECTION_PROFILE_ZONE
+    ensure_detection_profile(profile)
     
     zone = next((z for z in zones if z.get('id') == zone_id), None)
     if not zone:
@@ -2262,9 +2392,14 @@ def set_inference_config():
 
 
 @app.route('/api/models', methods=['GET'])
+@app.route('/api/offpost/models', methods=['GET'])
 def get_models():
     """获取可用的模型列表"""
+    profile = DETECTION_PROFILE_OFFPOST if request.path.startswith('/api/offpost/') else DETECTION_PROFILE_ZONE
     try:
+        profile_cfg = model_profile_config.get(profile, {})
+        profile_model = profile_cfg.get("model", current_model_name)
+        profile_imgsz = int(profile_cfg.get("imgsz", yolo_imgsz))
         models = []
         if os.path.exists(MODELS_DIR):
             for filename in os.listdir(MODELS_DIR):
@@ -2275,18 +2410,22 @@ def get_models():
                         "name": filename,
                         "size": file_size,
                         "size_mb": round(file_size / (1024 * 1024), 2),
-                        "current": filename == current_model_name
+                        "current": filename == profile_model
                     })
         models.sort(key=lambda x: x['name'])
-        return jsonify({"models": models, "current": current_model_name, "imgsz": yolo_imgsz})
+        return jsonify({"models": models, "current": profile_model, "imgsz": profile_imgsz})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 @app.route('/api/model', methods=['POST'])
+@app.route('/api/offpost/model', methods=['POST'])
 def set_model():
     """切换模型或更新推理配置（如 imgsz）"""
     global current_model_name, model, yolo_imgsz
+    profile = DETECTION_PROFILE_OFFPOST if request.path.startswith('/api/offpost/') else DETECTION_PROFILE_ZONE
+    if profile not in model_profile_config:
+        model_profile_config[profile] = {"model": current_model_name, "imgsz": yolo_imgsz}
     
     data = request.json or {}
     model_name = data.get('model')
@@ -2296,7 +2435,7 @@ def set_model():
         try:
             imgsz_int = int(imgsz_val)
             if 32 <= imgsz_int <= 2048:
-                yolo_imgsz = imgsz_int
+                model_profile_config[profile]["imgsz"] = imgsz_int
             else:
                 return jsonify({"success": False, "message": "imgsz 需在 32～2048 之间"}), 400
         except (TypeError, ValueError):
@@ -2305,12 +2444,16 @@ def set_model():
     if not model_name:
         # 仅更新 imgsz 等配置
         if imgsz_val is not None:
+            if profile == current_detection_profile:
+                yolo_imgsz = model_profile_config[profile]["imgsz"]
+            model_profile_config[profile]["model"] = model_profile_config[profile].get("model", current_model_name)
+            save_model_profile_config()
             save_system_config()
             return jsonify({
                 "success": True,
-                "message": f"推理尺寸已更新为 {yolo_imgsz}",
-                "current_model": current_model_name,
-                "imgsz": yolo_imgsz
+                "message": f"推理尺寸已更新为 {model_profile_config[profile]['imgsz']}",
+                "current_model": model_profile_config[profile]["model"],
+                "imgsz": model_profile_config[profile]["imgsz"]
             })
         return jsonify({"success": False, "message": "未指定模型名称"}), 400
     
@@ -2318,29 +2461,42 @@ def set_model():
     if not os.path.exists(model_path):
         return jsonify({"success": False, "message": f"模型文件不存在: {model_name}"}), 404
     
-    if model_name == current_model_name:
-        # 模型未变，仅更新 imgsz 等配置，不重新加载模型
+    if model_name == model_profile_config[profile].get("model", current_model_name):
+        # 模型未变，仅更新 imgsz 等配置
+        if profile == current_detection_profile:
+            yolo_imgsz = model_profile_config[profile]["imgsz"]
+        model_profile_config[profile]["model"] = model_name
+        save_model_profile_config()
         save_system_config()
         return jsonify({
             "success": True,
-            "message": f"推理尺寸已更新为 {yolo_imgsz}",
-            "current_model": current_model_name,
-            "imgsz": yolo_imgsz
+            "message": f"推理尺寸已更新为 {model_profile_config[profile]['imgsz']}",
+            "current_model": model_profile_config[profile]["model"],
+            "imgsz": model_profile_config[profile]["imgsz"]
         })
     
     try:
-        old_model_name = current_model_name
-        current_model_name = model_name
-        load_model()
+        old_model_name = model_profile_config[profile].get("model", current_model_name)
+        model_profile_config[profile]["model"] = model_name
+        if profile == current_detection_profile:
+            current_model_name = model_name
+            yolo_imgsz = model_profile_config[profile]["imgsz"]
+            load_model()
+        model_profile_config[profile]["model"] = current_model_name
+        if profile != current_detection_profile:
+            model_profile_config[profile]["model"] = model_name
+        save_model_profile_config()
         save_system_config()
         return jsonify({
             "success": True,
             "message": f"模型已切换: {old_model_name} -> {model_name}",
-            "current_model": current_model_name,
-            "imgsz": yolo_imgsz
+            "current_model": model_profile_config[profile]["model"],
+            "imgsz": model_profile_config[profile]["imgsz"]
         })
     except Exception as e:
-        current_model_name = old_model_name
+        model_profile_config[profile]["model"] = old_model_name
+        if profile == current_detection_profile:
+            current_model_name = old_model_name
         return jsonify({"success": False, "message": f"切换模型失败: {str(e)}"}), 500
 
 
@@ -3201,14 +3357,20 @@ def preview_recording_video(filename):
 
 
 @app.route('/api/alarm', methods=['GET'])
+@app.route('/api/offpost/alarm', methods=['GET'])
 def get_alarm_config():
     """获取报警配置"""
+    profile = DETECTION_PROFILE_OFFPOST if request.path.startswith('/api/offpost/') else DETECTION_PROFILE_ZONE
+    ensure_detection_profile(profile)
     return jsonify(alarm_config)
 
 @app.route('/api/alarm', methods=['POST'])
+@app.route('/api/offpost/alarm', methods=['POST'])
 def set_alarm_config():
     """设置报警配置"""
     global alarm_config
+    profile = DETECTION_PROFILE_OFFPOST if request.path.startswith('/api/offpost/') else DETECTION_PROFILE_ZONE
+    ensure_detection_profile(profile)
     
     data = request.json
     
@@ -3261,7 +3423,7 @@ def set_alarm_config():
                 # 使用默认路径
                 alarm_config['event_save_path'] = os.path.join(BASE_DIR, "alarm_events")
         
-        save_alarm_config()
+        save_alarm_config(profile)
         return jsonify({
             "success": True,
             "message": "报警配置已更新",

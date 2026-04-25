@@ -1,5 +1,6 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import MainView from '../views/MainView.vue'
+import HomeView from '../views/HomeView.vue'
 import VideoMonitor from '../components/VideoMonitor.vue'
 import LoginView from '../views/LoginView.vue'
 import axios from 'axios'
@@ -13,7 +14,19 @@ const routes = [
   },
   {
     path: '/',
-    name: 'Main',
+    name: 'Home',
+    component: HomeView,
+    meta: { requiresAuth: true }
+  },
+  {
+    path: '/zone-alarm',
+    name: 'ZoneAlarm',
+    component: MainView,
+    meta: { requiresAuth: true }
+  },
+  {
+    path: '/leave-monitor',
+    name: 'LeaveMonitor',
     component: MainView,
     meta: { requiresAuth: true }
   },

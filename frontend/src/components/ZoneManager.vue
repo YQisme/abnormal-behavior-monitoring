@@ -74,6 +74,10 @@ const props = defineProps({
   zones: {
     type: Array,
     default: () => []
+  },
+  apiPrefix: {
+    type: String,
+    default: '/api'
   }
 })
 
@@ -97,7 +101,7 @@ const editZone = (zone) => {
 
 const updateZoneEnabled = async (zone) => {
   try {
-    const res = await axios.put(`/api/zones/${zone.id}`, {
+    const res = await axios.put(`${props.apiPrefix}/zones/${zone.id}`, {
       enabled: zone.enabled
     })
     if (res.data.success) {
@@ -129,7 +133,7 @@ const renameZone = async (zone) => {
       }
     )
     
-    const res = await axios.post(`/api/zones/${zone.id}/rename`, {
+    const res = await axios.post(`${props.apiPrefix}/zones/${zone.id}/rename`, {
       name: newName.trim()
     })
     
@@ -157,7 +161,7 @@ const deleteZone = async (zone) => {
       }
     )
     
-    const res = await axios.delete(`/api/zones/${zone.id}`)
+    const res = await axios.delete(`${props.apiPrefix}/zones/${zone.id}`)
     
     if (res.data.success) {
       ElMessage.success('区域已删除')

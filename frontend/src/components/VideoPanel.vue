@@ -2,7 +2,7 @@
   <el-card shadow="hover">
     <template #header>
       <div class="card-header">
-        <span>区域报警</span>
+        <span>{{ panelTitle }}</span>
         <div class="video-stats">
           <span>FPS: {{ fps.toFixed(1) }}</span>
           <span>分辨率: {{ resolution }}</span>
@@ -36,6 +36,14 @@ const props = defineProps({
   zones: {
     type: Array,
     default: () => []
+  },
+  apiPrefix: {
+    type: String,
+    default: '/api'
+  },
+  panelTitle: {
+    type: String,
+    default: '区域报警'
   }
 })
 
@@ -103,6 +111,10 @@ watch(() => props.zones, (newZones) => {
     drawAllZones()
   }
 }, { deep: true })
+
+watch(() => props.apiPrefix, () => {
+  loadZones()
+})
 
 // 监听颜色配置变化，自动重新绘制
 watch([zoneFillColor, zoneBorderColor, zoneFillAlpha], () => {
@@ -483,7 +495,7 @@ const handleKeyPress = (event) => {
 
 const loadZones = async () => {
   try {
-    const res = await axios.get('/api/zones')
+    const res = await axios.get(`${props.apiPrefix}/zones`)
     if (res.data.zones) {
       emit('zones-updated', res.data.zones)
     }
@@ -515,7 +527,7 @@ const loadDisplayConfig = async () => {
 
 const createZoneToServer = async (points) => {
   try {
-    const res = await axios.post('/api/zones', {
+    const res = await axios.post(`${props.apiPrefix}/zones`, {
       points: points,
       name: `区域${props.zones.length + 1}`,
       enabled: true,
@@ -538,7 +550,7 @@ const createZoneToServer = async (points) => {
 
 const updateZoneToServer = async (zoneId, points) => {
   try {
-    const res = await axios.put(`/api/zones/${zoneId}`, {
+    const res = await axios.put(`${props.apiPrefix}/zones/${zoneId}`, {
       points: points
     })
     if (res.data.success) {

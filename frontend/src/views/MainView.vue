@@ -4,7 +4,7 @@
       <!-- 头部 -->
       <el-header class="app-header">
         <div class="header-content">
-          <h1>人员检测与区域报警系统</h1>
+          <h1>{{ pageTitle }}</h1>
           <div class="status-bar">
             <el-tag :type="connectionStatus === 'connected' ? 'success' : 'danger'" effect="dark">
               {{ connectionStatus === 'connected' ? '已连接' : '未连接' }}
@@ -26,6 +26,8 @@
             <VideoPanel
               ref="videoPanelRef"
               :zones="zones"
+              :api-prefix="alarmApiPrefix"
+              :panel-title="videoPanelTitle"
               @zones-updated="handleZonesUpdated"
             />
           </el-col>
@@ -56,10 +58,11 @@
         <!-- 下方：区域管理、日志、设置 -->
         <div class="bottom-nav-bar">
           <el-tabs v-model="activeTopTab" type="card" class="top-tabs">
-            <el-tab-pane label="区域管理" name="zones">
+            <el-tab-pane :label="zoneTabLabel" name="zones">
               <div class="tab-content">
                 <ZoneManager
                   :zones="zones"
+                  :api-prefix="alarmApiPrefix"
                   @zone-selected="handleZoneSelected"
                   @start-drawing="handleStartDrawing"
                   @zone-updated="handleZoneUpdated"
@@ -97,6 +100,7 @@
             <el-tab-pane label="设置" name="config">
               <div class="tab-content">
                 <ConfigPanel
+                  :alarm-api-prefix="alarmApiPrefix"
                   @model-changed="handleModelChanged"
                   @video-changed="handleVideoChanged"
                   @classes-changed="handleClassesChanged"
@@ -113,8 +117,8 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted } from 'vue'
-import { useRouter } from 'vue-router'
+import { ref, onMounted, onUnmounted, watch } from 'vue'
+import { useRouter, useRoute } from 'vue-router'
 import { io } from 'socket.io-client'
 import { ElMessage } from 'element-plus'
 import axios from 'axios'
@@ -126,6 +130,12 @@ import LogPanel from '../components/LogPanel.vue'
 import ZoneManager from '../components/ZoneManager.vue'
 
 const router = useRouter()
+const route = useRoute()
+const isLeaveMonitorMode = ref(false)
+const pageTitle = ref('人员检测与区域报警系统')
+const videoPanelTitle = ref('区域报警')
+const zoneTabLabel = ref('区域管理')
+const alarmApiPrefix = ref('/api')
 
 // 状态
 const connectionStatus = ref('disconnected')
@@ -147,7 +157,16 @@ const clearAlarmMqttLoading = ref(false)
 // Socket.IO 连接
 let socket = null
 
+const refreshPageMode = () => {
+  isLeaveMonitorMode.value = route.path === '/leave-monitor'
+  pageTitle.value = isLeaveMonitorMode.value ? '人员检测与离岗监测系统' : '人员检测与区域报警系统'
+  videoPanelTitle.value = isLeaveMonitorMode.value ? '离岗监测' : '区域报警'
+  zoneTabLabel.value = isLeaveMonitorMode.value ? '离岗区域管理' : '区域管理'
+  alarmApiPrefix.value = isLeaveMonitorMode.value ? '/api/offpost' : '/api'
+}
+
 onMounted(() => {
+  refreshPageMode()
   // 检查登录状态
   checkLoginStatus()
 
@@ -225,10 +244,15 @@ onUnmounted(() => {
   }
 })
 
+watch(() => route.path, () => {
+  refreshPageMode()
+  handleZonesUpdated()
+})
+
 const handleZonesUpdated = async () => {
   // 重新加载区域列表
   try {
-    const res = await axios.get('/api/zones')
+    const res = await axios.get(`${alarmApiPrefix.value}/zones`)
     if (res.data.zones) {
       zones.value = res.data.zones
       zonesCount.value = res.data.zones.length
@@ -327,6 +351,7 @@ const handleAlarmChanged = () => {
 const goToMonitor = () => {
   router.push('/monitor')
 }
+
 // 检查登录状态
 const checkLoginStatus = async () => {
   try {

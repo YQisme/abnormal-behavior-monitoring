@@ -1,0 +1,10 @@
+{
+  "zone_alarm": {
+    "model": "yolo11l.pt",
+    "imgsz": 640
+  },
+  "offpost_monitor": {
+    "model": "yolo11m.pt",
+    "imgsz": 640
+  }
+}

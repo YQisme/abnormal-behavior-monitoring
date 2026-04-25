@@ -481,6 +481,13 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { CircleCheck, CircleClose, QuestionFilled } from '@element-plus/icons-vue'
 import axios from 'axios'
 
+const props = defineProps({
+  alarmApiPrefix: {
+    type: String,
+    default: '/api'
+  }
+})
+
 const emit = defineEmits(['model-changed', 'video-changed', 'classes-changed', 'display-changed', 'alarm-changed'])
 
 const activeTab = ref('model')
@@ -684,9 +691,14 @@ onUnmounted(() => {
   }
 })
 
+watch(() => props.alarmApiPrefix, () => {
+  loadModels()
+  loadAlarmConfig()
+})
+
 const loadModels = async () => {
   try {
-    const res = await axios.get('/api/models')
+    const res = await axios.get(`${props.alarmApiPrefix}/models`)
     models.value = res.data.models || []
     const current = models.value.find(m => m.current)
     if (current) {
@@ -827,7 +839,7 @@ const loadDisplayConfig = async () => {
 
 const loadAlarmConfig = async () => {
   try {
-    const res = await axios.get('/api/alarm')
+    const res = await axios.get(`${props.alarmApiPrefix}/alarm`)
     if (res.data.debounce_time !== undefined) {
       alarmForm.value.debounce_time = res.data.debounce_time
     }
@@ -1031,7 +1043,7 @@ const applyModel = async () => {
   
   try {
     modelLoading.value = true
-    const res = await axios.post('/api/model', {
+    const res = await axios.post(`${props.alarmApiPrefix}/model`, {
       model: modelForm.value.model,
       imgsz: modelForm.value.imgsz
     })
@@ -1264,7 +1276,7 @@ const selectEventSavePath = async () => {
 const applyAlarm = async () => {
   alarmLoading.value = true
   try {
-    const res = await axios.post('/api/alarm', {
+    const res = await axios.post(`${props.alarmApiPrefix}/alarm`, {
       debounce_time: alarmForm.value.debounce_time,
       detection_mode: alarmForm.value.detection_mode,
       once_per_id: alarmForm.value.once_per_id,
