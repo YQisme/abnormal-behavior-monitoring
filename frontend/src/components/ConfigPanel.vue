@@ -739,6 +739,7 @@ watch(() => props.alarmApiPrefix, () => {
   loadModels()
   loadVideoUrl()
   loadAlarmConfig()
+  loadInferenceControl()
 })
 
 watch(
@@ -1045,7 +1046,7 @@ const applyMqtt = async () => {
 const loadInferenceControl = async () => {
   inferenceStatusLoading.value = true
   try {
-    const res = await axios.get('/api/inference')
+    const res = await axios.get(`${props.alarmApiPrefix}/inference`)
     inferenceRunning.value = !!res.data.running
     inferenceAutoStart.value = !!res.data.auto_start
   } catch (error) {
@@ -1059,7 +1060,7 @@ const loadInferenceControl = async () => {
 const startInference = async () => {
   inferenceActionLoading.value = true
   try {
-    const res = await axios.post('/api/inference/start')
+    const res = await axios.post(`${props.alarmApiPrefix}/inference/start`)
     if (res.data.success) {
       inferenceRunning.value = true
       ElMessage.success(res.data.message || '推理已开始')
@@ -1077,7 +1078,7 @@ const startInference = async () => {
 const stopInference = async () => {
   inferenceActionLoading.value = true
   try {
-    const res = await axios.post('/api/inference/stop')
+    const res = await axios.post(`${props.alarmApiPrefix}/inference/stop`)
     if (res.data.success) {
       inferenceRunning.value = false
       ElMessage.success(res.data.message || '推理已停止')
@@ -1095,7 +1096,7 @@ const stopInference = async () => {
 const updateInferenceAutoStart = async (value) => {
   inferenceConfigLoading.value = true
   try {
-    const res = await axios.post('/api/inference/config', { auto_start: value })
+    const res = await axios.post(`${props.alarmApiPrefix}/inference/config`, { auto_start: value })
     if (res.data.success) {
       inferenceAutoStart.value = !!res.data.auto_start
       ElMessage.success('自动启动配置已更新')

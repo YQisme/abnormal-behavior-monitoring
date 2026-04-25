@@ -188,6 +188,11 @@ DETECTION_PROFILE_FILES = {
     }
 }
 current_detection_profile = DETECTION_PROFILE_ZONE
+inference_running_profiles = {
+    DETECTION_PROFILE_ZONE: False,
+    DETECTION_PROFILE_OFFPOST: False,
+    DETECTION_PROFILE_DROWSY: False
+}
 model_profile_config_file = os.path.join(CONFIG_DIR, "model_profile_config.json")
 model_profile_config = {
     DETECTION_PROFILE_ZONE: {
@@ -309,7 +314,7 @@ camera_check_interval = 5  # 摄像头检测间隔（秒）
 camera_last_status = "unknown"  # 上次检测到的状态，用于判断状态变化
 camera_offline_alarm_triggered = {}  # 摄像头离线报警记录，用于防抖
 model = None  # 模型对象，延迟加载
-inference_running = False  # 推理是否运行（可由前端控制）
+inference_running = False  # 是否存在任一档案在运行（兼容旧状态字段）
 auto_start_inference = False  # 服务启动后是否自动开始推理
 inference_state_lock = threading.Lock()  # 推理状态锁
 
@@ -439,7 +444,7 @@ def camera_status_checker():
 # 加载系统配置
 def load_system_config():
     """从配置文件加载系统配置"""
-    global current_model_name, yolo_imgsz, video_path, camera_ip, model, auto_start_inference, inference_running
+    global current_model_name, yolo_imgsz, video_path, camera_ip, model, auto_start_inference, inference_running, inference_running_profiles
     if os.path.exists(config_file):
         try:
             with open(config_file, 'r') as f:
@@ -472,7 +477,10 @@ def load_system_config():
     
     # 根据配置决定是否自动启动推理
     with inference_state_lock:
-        inference_running = auto_start_inference
+        for profile_key in inference_running_profiles:
+            inference_running_profiles[profile_key] = False
+        inference_running_profiles[current_detection_profile] = auto_start_inference
+        inference_running = any(inference_running_profiles.values())
     if auto_start_inference:
         load_model()
         backend_logger.info("服务启动后自动开始推理")
@@ -1589,7 +1597,7 @@ def video_reader():
 
 def detection_worker():
     """检测工作线程"""
-    global latest_frame, latest_results, latest_annotated_frame, zones, fps_counter, display_config, zone_has_people_mqtt_sent, inference_running, offpost_last_seen_person_ts, offpost_absence_alarm_sent
+    global latest_frame, latest_results, latest_annotated_frame, zones, fps_counter, display_config, zone_has_people_mqtt_sent, inference_running, offpost_last_seen_person_ts, offpost_absence_alarm_sent, inference_running_profiles
     
     while not stop_flag.is_set():
         try:
@@ -1610,7 +1618,7 @@ def detection_worker():
             latest_frame = frame.copy()
 
             with inference_state_lock:
-                running = inference_running
+                running = bool(inference_running_profiles.get(current_detection_profile, False))
             if not running:
                 latest_results = None
                 latest_annotated_frame = frame.copy()
@@ -2510,53 +2518,72 @@ def get_status():
 
 
 @app.route('/api/inference', methods=['GET'])
+@app.route('/api/offpost/inference', methods=['GET'])
+@app.route('/api/drowsy/inference', methods=['GET'])
 def get_inference_status():
     """获取推理状态和自动启动配置"""
-    global inference_running, auto_start_inference
+    global inference_running, auto_start_inference, current_detection_profile, inference_running_profiles
+    profile = get_profile_from_request_path(request.path)
     with inference_state_lock:
-        running = inference_running
+        running = bool(inference_running_profiles.get(profile, False))
     return jsonify({
         "running": running,
+        "profile": profile,
+        "active_profile": current_detection_profile,
+        "any_running": inference_running,
         "auto_start": auto_start_inference
     })
 
 
 @app.route('/api/inference/start', methods=['POST'])
+@app.route('/api/offpost/inference/start', methods=['POST'])
+@app.route('/api/drowsy/inference/start', methods=['POST'])
 def start_inference_api():
     """开始推理"""
-    global inference_running
+    global inference_running, inference_running_profiles
+    profile = get_profile_from_request_path(request.path)
     try:
         with inference_state_lock:
-            if inference_running:
-                return jsonify({"success": True, "message": "推理已在运行"})
+            already_running = bool(inference_running_profiles.get(profile, False))
+            if already_running:
+                return jsonify({"success": True, "message": "当前模式推理已在运行", "profile": profile})
+        ensure_detection_profile(profile)
         if model is None:
             load_model()
         with inference_state_lock:
-            inference_running = True
-        return jsonify({"success": True, "message": "推理已开始"})
+            inference_running_profiles[profile] = True
+            inference_running = any(inference_running_profiles.values())
+        return jsonify({"success": True, "message": "推理已开始", "profile": profile})
     except Exception as e:
         backend_logger.error(f"开始推理失败: {e}")
         return jsonify({"success": False, "message": f"开始推理失败: {str(e)}"}), 500
 
 
 @app.route('/api/inference/stop', methods=['POST'])
+@app.route('/api/offpost/inference/stop', methods=['POST'])
+@app.route('/api/drowsy/inference/stop', methods=['POST'])
 def stop_inference_api():
     """停止推理（保留视频流，不再执行模型推理）"""
-    global inference_running, zone_has_people_mqtt_sent
+    global inference_running, zone_has_people_mqtt_sent, current_detection_profile, inference_running_profiles
+    profile = get_profile_from_request_path(request.path)
     with inference_state_lock:
-        if not inference_running:
-            return jsonify({"success": True, "message": "推理已停止"})
-        inference_running = False
+        profile_running = bool(inference_running_profiles.get(profile, False))
+        if not profile_running:
+            return jsonify({"success": True, "message": "当前模式推理已停止", "profile": profile})
+        inference_running_profiles[profile] = False
+        inference_running = any(inference_running_profiles.values())
 
     # 停止时如果此前发送过 hasPeople=1，则补发恢复消息
-    if zone_has_people_mqtt_sent:
+    if profile == current_detection_profile and zone_has_people_mqtt_sent:
         send_mqtt_message({"hasPeople": 0})
         zone_has_people_mqtt_sent = False
 
-    return jsonify({"success": True, "message": "推理已停止"})
+    return jsonify({"success": True, "message": "推理已停止", "profile": profile})
 
 
 @app.route('/api/inference/config', methods=['POST'])
+@app.route('/api/offpost/inference/config', methods=['POST'])
+@app.route('/api/drowsy/inference/config', methods=['POST'])
 def set_inference_config():
     """设置推理自动启动配置"""
     global auto_start_inference
