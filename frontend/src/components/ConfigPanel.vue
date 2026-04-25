@@ -27,6 +27,45 @@
           <el-form-item>
             <el-button type="primary" @click="applyModel" :loading="modelLoading">应用</el-button>
           </el-form-item>
+          <el-divider />
+          <el-form-item label="模型推理状态">
+            <el-tag :type="inferenceRunning ? 'success' : 'info'" size="large">
+              {{ inferenceRunning ? '运行中' : '已停止' }}
+            </el-tag>
+            <el-button
+              v-if="!inferenceRunning"
+              type="success"
+              style="margin-left: 10px"
+              @click="startInference"
+              :loading="inferenceActionLoading"
+            >
+              开始推理
+            </el-button>
+            <el-button
+              v-else
+              type="danger"
+              style="margin-left: 10px"
+              @click="stopInference"
+              :loading="inferenceActionLoading"
+            >
+              停止推理
+            </el-button>
+            <el-button
+              size="small"
+              style="margin-left: 10px"
+              @click="loadInferenceControl"
+              :loading="inferenceStatusLoading"
+            >
+              刷新状态
+            </el-button>
+          </el-form-item>
+          <el-form-item label="服务启动后自动开始">
+            <el-switch
+              v-model="inferenceAutoStart"
+              :loading="inferenceConfigLoading"
+              @change="updateInferenceAutoStart"
+            />
+          </el-form-item>
         </el-form>
       </el-tab-pane>
 
@@ -510,6 +549,11 @@ const occlusionLoading = ref(false)
 const loginLoading = ref(false)
 const mqttLoading = ref(false)
 const restartLoading = ref(false)
+const inferenceRunning = ref(false)
+const inferenceAutoStart = ref(false)
+const inferenceStatusLoading = ref(false)
+const inferenceActionLoading = ref(false)
+const inferenceConfigLoading = ref(false)
 
 // RGB 和 Hex 转换
 const rgbToHex = (r, g, b) => {
@@ -624,7 +668,8 @@ onMounted(async () => {
     loadAlarmConfig(),
     loadOcclusionConfig(),
     loadLoginConfig(),
-    loadMqttConfig()
+    loadMqttConfig(),
+    loadInferenceControl()
   ])
   
   // 每5秒自动更新摄像头状态
@@ -892,6 +937,75 @@ const applyMqtt = async () => {
     }
   } finally {
     mqttLoading.value = false
+  }
+}
+
+const loadInferenceControl = async () => {
+  inferenceStatusLoading.value = true
+  try {
+    const res = await axios.get('/api/inference')
+    inferenceRunning.value = !!res.data.running
+    inferenceAutoStart.value = !!res.data.auto_start
+  } catch (error) {
+    console.error('加载推理控制状态失败:', error)
+    ElMessage.error('加载推理状态失败')
+  } finally {
+    inferenceStatusLoading.value = false
+  }
+}
+
+const startInference = async () => {
+  inferenceActionLoading.value = true
+  try {
+    const res = await axios.post('/api/inference/start')
+    if (res.data.success) {
+      inferenceRunning.value = true
+      ElMessage.success(res.data.message || '推理已开始')
+    } else {
+      ElMessage.error(res.data.message || '开始推理失败')
+    }
+  } catch (error) {
+    console.error('开始推理失败:', error)
+    ElMessage.error(error.response?.data?.message || '开始推理失败')
+  } finally {
+    inferenceActionLoading.value = false
+  }
+}
+
+const stopInference = async () => {
+  inferenceActionLoading.value = true
+  try {
+    const res = await axios.post('/api/inference/stop')
+    if (res.data.success) {
+      inferenceRunning.value = false
+      ElMessage.success(res.data.message || '推理已停止')
+    } else {
+      ElMessage.error(res.data.message || '停止推理失败')
+    }
+  } catch (error) {
+    console.error('停止推理失败:', error)
+    ElMessage.error(error.response?.data?.message || '停止推理失败')
+  } finally {
+    inferenceActionLoading.value = false
+  }
+}
+
+const updateInferenceAutoStart = async (value) => {
+  inferenceConfigLoading.value = true
+  try {
+    const res = await axios.post('/api/inference/config', { auto_start: value })
+    if (res.data.success) {
+      inferenceAutoStart.value = !!res.data.auto_start
+      ElMessage.success('自动启动配置已更新')
+    } else {
+      throw new Error(res.data.message || '设置失败')
+    }
+  } catch (error) {
+    inferenceAutoStart.value = !value
+    console.error('更新自动启动配置失败:', error)
+    ElMessage.error(error.response?.data?.message || error.message || '更新失败')
+  } finally {
+    inferenceConfigLoading.value = false
   }
 }
 

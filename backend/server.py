@@ -249,6 +249,9 @@ camera_check_interval = 5  # 摄像头检测间隔（秒）
 camera_last_status = "unknown"  # 上次检测到的状态，用于判断状态变化
 camera_offline_alarm_triggered = {}  # 摄像头离线报警记录，用于防抖
 model = None  # 模型对象，延迟加载
+inference_running = False  # 推理是否运行（可由前端控制）
+auto_start_inference = False  # 服务启动后是否自动开始推理
+inference_state_lock = threading.Lock()  # 推理状态锁
 
 # 从RTSP URL中提取IP地址
 def extract_ip_from_rtsp(rtsp_url):
@@ -376,7 +379,7 @@ def camera_status_checker():
 # 加载系统配置
 def load_system_config():
     """从配置文件加载系统配置"""
-    global current_model_name, yolo_imgsz, video_path, camera_ip, model
+    global current_model_name, yolo_imgsz, video_path, camera_ip, model, auto_start_inference, inference_running
     if os.path.exists(config_file):
         try:
             with open(config_file, 'r') as f:
@@ -394,6 +397,8 @@ def load_system_config():
                     video_path = config['video_url']
                 if 'camera_ip' in config:
                     camera_ip = config['camera_ip']
+                if 'auto_start_inference' in config:
+                    auto_start_inference = bool(config['auto_start_inference'])
                 backend_logger.info(f"已从 {config_file} 加载系统配置")
         except Exception as e:
             backend_logger.error(f"加载系统配置文件失败: {e}")
@@ -405,18 +410,25 @@ def load_system_config():
             camera_ip = extracted_ip
             backend_logger.info(f"从RTSP URL中提取IP地址: {camera_ip}")
     
-    # 加载模型
-    load_model()
+    # 根据配置决定是否自动启动推理
+    with inference_state_lock:
+        inference_running = auto_start_inference
+    if auto_start_inference:
+        load_model()
+        backend_logger.info("服务启动后自动开始推理")
+    else:
+        backend_logger.info("服务启动后默认不启动推理，等待前端手动开始")
 
 def save_system_config():
     """保存系统配置到文件"""
-    global camera_ip, camera_check_interval, yolo_imgsz
+    global camera_ip, camera_check_interval, yolo_imgsz, auto_start_inference
     config = {
         "model": current_model_name,
         "imgsz": yolo_imgsz,
         "video_url": video_path,
         "camera_ip": camera_ip,
-        "camera_check_interval": camera_check_interval
+        "camera_check_interval": camera_check_interval,
+        "auto_start_inference": auto_start_inference
     }
     try:
         with open(config_file, 'w') as f:
@@ -1341,7 +1353,7 @@ def video_reader():
 
 def detection_worker():
     """检测工作线程"""
-    global latest_frame, latest_results, latest_annotated_frame, zones, fps_counter, display_config, zone_has_people_mqtt_sent
+    global latest_frame, latest_results, latest_annotated_frame, zones, fps_counter, display_config, zone_has_people_mqtt_sent, inference_running
     
     while not stop_flag.is_set():
         try:
@@ -1360,6 +1372,27 @@ def detection_worker():
                     continue
             
             latest_frame = frame.copy()
+
+            with inference_state_lock:
+                running = inference_running
+            if not running:
+                latest_results = None
+                latest_annotated_frame = frame.copy()
+                _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                frame_base64 = base64.b64encode(buffer).decode('utf-8')
+                detection_data = {
+                    "frame": f"data:image/jpeg;base64,{frame_base64}",
+                    "zones": zones,
+                    "detections": [],
+                    "fps": 0.0,
+                    "resolution": {
+                        "width": video_info["width"],
+                        "height": video_info["height"]
+                    }
+                }
+                socketio.emit('frame', detection_data)
+                time.sleep(0.05)
+                continue
             
             # YOLO跟踪检测（使用锁保护模型访问）
             try:
@@ -2132,7 +2165,7 @@ def rename_zone(zone_id):
 @app.route('/api/status', methods=['GET'])
 def get_status():
     """获取系统状态"""
-    global gpu_available, device
+    global gpu_available, device, inference_running, auto_start_inference
     # 重新检测GPU状态
     gpu_available, device = check_gpu_available()
     
@@ -2145,7 +2178,73 @@ def get_status():
         "current_model": current_model_name,
         "video_url": video_path,
         "gpu_available": gpu_available,
-        "device": str(device)
+        "device": str(device),
+        "inference_running": inference_running,
+        "auto_start_inference": auto_start_inference
+    })
+
+
+@app.route('/api/inference', methods=['GET'])
+def get_inference_status():
+    """获取推理状态和自动启动配置"""
+    global inference_running, auto_start_inference
+    with inference_state_lock:
+        running = inference_running
+    return jsonify({
+        "running": running,
+        "auto_start": auto_start_inference
+    })
+
+
+@app.route('/api/inference/start', methods=['POST'])
+def start_inference_api():
+    """开始推理"""
+    global inference_running
+    try:
+        with inference_state_lock:
+            if inference_running:
+                return jsonify({"success": True, "message": "推理已在运行"})
+        if model is None:
+            load_model()
+        with inference_state_lock:
+            inference_running = True
+        return jsonify({"success": True, "message": "推理已开始"})
+    except Exception as e:
+        backend_logger.error(f"开始推理失败: {e}")
+        return jsonify({"success": False, "message": f"开始推理失败: {str(e)}"}), 500
+
+
+@app.route('/api/inference/stop', methods=['POST'])
+def stop_inference_api():
+    """停止推理（保留视频流，不再执行模型推理）"""
+    global inference_running, zone_has_people_mqtt_sent
+    with inference_state_lock:
+        if not inference_running:
+            return jsonify({"success": True, "message": "推理已停止"})
+        inference_running = False
+
+    # 停止时如果此前发送过 hasPeople=1，则补发恢复消息
+    if zone_has_people_mqtt_sent:
+        send_mqtt_message({"hasPeople": 0})
+        zone_has_people_mqtt_sent = False
+
+    return jsonify({"success": True, "message": "推理已停止"})
+
+
+@app.route('/api/inference/config', methods=['POST'])
+def set_inference_config():
+    """设置推理自动启动配置"""
+    global auto_start_inference
+    data = request.json or {}
+    if 'auto_start' not in data:
+        return jsonify({"success": False, "message": "缺少参数 auto_start"}), 400
+
+    auto_start_inference = bool(data.get('auto_start'))
+    save_system_config()
+    return jsonify({
+        "success": True,
+        "message": "自动启动配置已更新",
+        "auto_start": auto_start_inference
     })
 
 
