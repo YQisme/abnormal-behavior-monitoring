@@ -3016,21 +3016,29 @@ def get_mqtt_config():
 @app.route('/api/mqtt/clear_alarm', methods=['POST'])
 @login_required
 def clear_alarm_mqtt():
-    """清除报警信息：向 MQTT 发送 isOffline/isOccluded/hasPeople 的恢复消息"""
+    """清除报警信息：仅清除服务端报警记录，不发送 MQTT 消息"""
+    global alarm_triggered, occlusion_alarm_triggered, camera_offline_alarm_triggered
+    global zone_has_people_mqtt_sent, occlusion_mqtt_1_sent, offpost_absence_alarm_sent, offpost_last_seen_person_ts
     try:
-        send_mqtt_message({"isOffline": 0})
-        send_mqtt_message({"isOccluded": 0})
-        send_mqtt_message({"hasPeople": 0})
-        return jsonify({"success": True, "message": "已发送清除报警信息到 MQTT"})
+        alarm_triggered.clear()
+        occlusion_alarm_triggered.clear()
+        camera_offline_alarm_triggered.clear()
+        zone_has_people_mqtt_sent = False
+        occlusion_mqtt_1_sent = False
+        offpost_absence_alarm_sent = False
+        offpost_last_seen_person_ts = time.time()
+        # 通知所有前端客户端清空当前报警列表
+        socketio.emit('alarm_cleared', {'time': datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+        return jsonify({"success": True, "message": "报警记录已清除"})
     except Exception as e:
-        backend_logger.error(f"清除报警 MQTT 发送失败: {e}")
+        backend_logger.error(f"清除报警记录失败: {e}")
         return jsonify({"success": False, "message": str(e)}), 500
 
 @app.route('/api/mqtt', methods=['POST'])
 @login_required
 def set_mqtt_config():
     """设置MQTT配置"""
-    global mqtt_config
+    global mqtt_config, mqtt_client
     
     data = request.json
     

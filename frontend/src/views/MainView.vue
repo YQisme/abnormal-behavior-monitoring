@@ -249,6 +249,10 @@ onMounted(() => {
       alarms.value.pop()
     }
   })
+  
+  socket.on('alarm_cleared', () => {
+    alarms.value = []
+  })
 
   socket.on('log', (data) => {
     // 系统日志
@@ -314,7 +318,9 @@ const clearAlarmMqtt = async () => {
   try {
     const res = await axios.post('/api/mqtt/clear_alarm')
     if (res.data.success) {
-      ElMessage.success(res.data.message || '已发送清除报警信息到 MQTT')
+      // 无论是否收到 WebSocket 广播，当前页面都立即清空
+      alarms.value = []
+      ElMessage.success(res.data.message || '报警记录已清除')
     } else {
       ElMessage.warning(res.data.message || '操作失败')
     }
