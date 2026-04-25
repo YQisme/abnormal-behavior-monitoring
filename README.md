@@ -3,6 +3,10 @@
 基于 YOLO 的实时目标检测系统，支持80个COCO类别检测，支持多个自定义多边形监控区域，当目标进入指定区域时自动触发报警。采用前后端分离架构（BS架构），提供 Web 界面进行可视化操作。支持用户登录认证、MQTT报警推送、视频录制、摄像头状态检测、画面遮挡检测等丰富功能。
 
 **主要特性**：
+- 🧭 三种监测模式：区域报警、离岗监测、瞌睡监测
+- 🗂️ 按模式独立配置：区域、报警参数、模型参数、视频源
+- 🧪 按模式独立推理控制：每个模式可单独开始/停止推理
+- 📝 按模式独立日志展示：日志按 `profile` 分流，不同模式不重叠
 - 🎯 支持多类别目标检测（人、车、动物等80个类别）
 - 🔄 支持动态切换模型和视频源
 - ⚙️ 支持类别选择、自定义名称、置信度设置
@@ -49,6 +53,37 @@
 - 📹 **摄像头状态检测**：自动检测摄像头在线/离线状态，支持离线报警
 - 👁️ **画面遮挡检测**：检测摄像头画面是否被遮挡，支持遮挡报警
 - 📋 **操作日志**：记录用户操作和系统事件，便于审计和问题排查
+
+## 三模式使用说明（重要）
+
+系统提供 3 种监测模式，对应不同页面/路由：
+
+- **区域报警**：`/monitor`（API 前缀：`/api`）
+- **离岗监测**：`/leave-monitor`（API 前缀：`/api/offpost`）
+- **瞌睡监测**：`/drowsy-monitor`（API 前缀：`/api/drowsy`）
+
+### 配置隔离规则
+
+以下配置按模式独立保存、互不覆盖：
+
+- 区域配置（zones）
+- 报警配置（alarm）
+- 模型档案（model/imgsz）
+- 视频档案（video_url/camera_ip/camera_check_interval）
+
+### 推理控制规则
+
+- 每个模式都有独立的推理控制接口：`<mode-prefix>/inference/*`
+- 点击“开始推理”只会对当前模式生效
+- 检测线程只在“当前激活模式 + 该模式 running=true”时执行推理
+
+> 说明：系统为单引擎架构，`current_detection_profile` 会随当前访问模式切换；文档中的“独立控制”指的是模式状态独立记录与展示，不是三个模型并行同时推理。
+
+### 日志分流规则
+
+- 后端 `log` 事件会携带 `profile`
+- 前端按 `profile + logger` 双维度分流展示
+- 因此在某个模式页面只会看到该模式自己的日志（操作日志/后端日志/推理日志）
 
 ## 技术栈
 
@@ -830,8 +865,9 @@ sudo journalctl -u yolo-detection -f
 
 #### 7. 查看系统日志
 
-- **"系统日志"** 面板实时显示系统日志和YOLO推理日志
+- **"日志"** 面板包含三类：**操作日志 / 后端日志 / 推理日志**
 - 日志按级别和来源用不同颜色区分
+- 日志按监测模式隔离展示（区域报警 / 离岗监测 / 瞌睡监测互不重叠）
 - 支持自动滚动和手动清空日志
 - 所有日志同时保存到 `logs/` 目录
 
@@ -1394,9 +1430,46 @@ GET /api/video/processed_stream
     "timestamp": "2024-01-01 12:00:00",
     "level": "INFO",
     "logger": "backend",
+    "profile": "offpost_monitor",
     "message": "模型已加载: yolo11n_640.engine (将使用GPU模式)"
   }
   ```
+
+#### 推理控制 API（按模式）
+
+以下接口均支持三种前缀：
+
+- 区域报警：`/api`
+- 离岗监测：`/api/offpost`
+- 瞌睡监测：`/api/drowsy`
+
+接口列表：
+
+- `GET <prefix>/inference`：获取当前模式推理状态
+- `POST <prefix>/inference/start`：开始当前模式推理
+- `POST <prefix>/inference/stop`：停止当前模式推理
+- `POST <prefix>/inference/config`：设置自动启动配置
+
+示例（离岗监测）：
+
+```http
+GET /api/offpost/inference
+POST /api/offpost/inference/start
+POST /api/offpost/inference/stop
+POST /api/offpost/inference/config
+```
+
+`GET <prefix>/inference` 响应示例：
+
+```json
+{
+  "running": true,
+  "profile": "offpost_monitor",
+  "active_profile": "offpost_monitor",
+  "any_running": true,
+  "auto_start": false
+}
+```
 - `alarm`：报警信息
   ```json
   {
