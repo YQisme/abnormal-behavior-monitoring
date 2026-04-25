@@ -73,7 +73,18 @@
       <el-tab-pane v-if="isTabVisible('video')" label="视频配置" name="video">
         <el-form :model="videoForm" label-width="120px">
           <el-form-item label="视频URL">
-            <el-input v-model="videoForm.video_url" placeholder="rtsp://..." />
+            <el-autocomplete
+              v-model="videoForm.video_url"
+              :fetch-suggestions="queryVideoSourceSuggestions"
+              placeholder="rtsp://... 或输入摄像头索引(如 0/1/2 => /dev/video0/1/2)"
+              clearable
+              style="width: 420px"
+              trigger-on-focus
+            >
+              <template #default="{ item }">
+                <div>{{ item.label }}</div>
+              </template>
+            </el-autocomplete>
           </el-form-item>
           <el-form-item label="摄像头IP">
             <el-input 
@@ -519,8 +530,10 @@ const videoForm = ref({
   camera_status: 'unknown',
   camera_check_interval: 5
 })
+const localCameraSuggestions = ref([])
 const statusChecking = ref(false)
 let statusCheckInterval = null
+let videoConfigRequestSeq = 0
 const displayForm = ref({
   font_size: 16,
   box_thickness: 2,
@@ -686,6 +699,7 @@ onMounted(async () => {
   await Promise.allSettled([
     loadModels(),
     loadVideoUrl(),
+    loadLocalCameras(),
     loadClasses(),
     loadDisplayConfig(),
     loadAlarmConfig(),
@@ -709,6 +723,7 @@ onUnmounted(() => {
 
 watch(() => props.alarmApiPrefix, () => {
   loadModels()
+  loadVideoUrl()
   loadAlarmConfig()
 })
 
@@ -741,23 +756,52 @@ const loadModels = async () => {
 }
 
 const loadVideoUrl = async () => {
+  const requestSeq = ++videoConfigRequestSeq
   try {
-    const res = await axios.get('/api/video')
-    if (res.data.video_url) {
+    const res = await axios.get(`${props.alarmApiPrefix}/video`)
+    if (requestSeq !== videoConfigRequestSeq) return
+    if (res.data.video_url !== undefined) {
       videoForm.value.video_url = res.data.video_url
     }
-    if (res.data.camera_ip) {
+    if (res.data.camera_ip !== undefined) {
       videoForm.value.camera_ip = res.data.camera_ip
     }
-    if (res.data.camera_status) {
+    if (res.data.camera_status !== undefined) {
       videoForm.value.camera_status = res.data.camera_status
     }
-    if (res.data.camera_check_interval) {
+    if (res.data.camera_check_interval !== undefined) {
       videoForm.value.camera_check_interval = res.data.camera_check_interval
     }
   } catch (error) {
     console.error('加载视频配置失败:', error)
   }
+}
+
+const loadLocalCameras = async () => {
+  try {
+    const res = await axios.get('/api/video/local_cameras')
+    const cameras = Array.isArray(res.data?.cameras) ? res.data.cameras : []
+    localCameraSuggestions.value = cameras.map(cam => ({
+      value: String(cam.index),
+      label: `${cam.index} (${cam.device})`
+    }))
+  } catch (error) {
+    console.error('加载本地摄像头列表失败:', error)
+    localCameraSuggestions.value = []
+  }
+}
+
+const queryVideoSourceSuggestions = (queryString, cb) => {
+  const source = localCameraSuggestions.value
+  const query = (queryString || '').trim().toLowerCase()
+  if (!query) {
+    cb(source)
+    return
+  }
+  const results = source.filter(item => {
+    return item.value.toLowerCase().includes(query) || item.label.toLowerCase().includes(query)
+  })
+  cb(results)
 }
 
 // 获取摄像头状态类型
@@ -787,16 +831,21 @@ const getCameraStatusText = (status) => {
 // 检测摄像头状态
 const checkCameraStatus = async () => {
   statusChecking.value = true
+  const requestSeq = ++videoConfigRequestSeq
   try {
-    const res = await axios.get('/api/video')
-    if (res.data.camera_status) {
+    const res = await axios.get(`${props.alarmApiPrefix}/video`)
+    if (requestSeq !== videoConfigRequestSeq) return
+    if (res.data.video_url !== undefined) {
+      videoForm.value.video_url = res.data.video_url
+    }
+    if (res.data.camera_status !== undefined) {
       videoForm.value.camera_status = res.data.camera_status
-      if (res.data.camera_ip) {
-        videoForm.value.camera_ip = res.data.camera_ip
-      }
-      if (res.data.camera_check_interval) {
-        videoForm.value.camera_check_interval = res.data.camera_check_interval
-      }
+    }
+    if (res.data.camera_ip !== undefined) {
+      videoForm.value.camera_ip = res.data.camera_ip
+    }
+    if (res.data.camera_check_interval !== undefined) {
+      videoForm.value.camera_check_interval = res.data.camera_check_interval
     }
   } catch (error) {
     console.error('检测摄像头状态失败:', error)
@@ -1089,7 +1138,7 @@ const applyModel = async () => {
 
 const applyVideo = async () => {
   if (!videoForm.value.video_url.trim()) {
-    ElMessage.warning('请输入视频URL')
+    ElMessage.warning('请输入视频URL，或输入摄像头索引（如0/1/2）')
     return
   }
   
@@ -1101,7 +1150,7 @@ const applyVideo = async () => {
     )
     
     videoLoading.value = true
-    const res = await axios.post('/api/video', { 
+    const res = await axios.post(`${props.alarmApiPrefix}/video`, { 
       video_url: videoForm.value.video_url,
       camera_ip: videoForm.value.camera_ip || '',
       camera_check_interval: videoForm.value.camera_check_interval

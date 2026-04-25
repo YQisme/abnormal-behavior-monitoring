@@ -8,6 +8,7 @@ import queue
 import time
 import json
 import os
+import glob
 import base64
 import numpy as np
 from datetime import datetime
@@ -194,6 +195,24 @@ model_profile_config = {
     DETECTION_PROFILE_DROWSY: {
         "model": "yolo26m_640_int8.engine",
         "imgsz": 640
+    }
+}
+video_profile_config_file = os.path.join(CONFIG_DIR, "video_profile_config.json")
+video_profile_config = {
+    DETECTION_PROFILE_ZONE: {
+        "video_url": "rtsp://admin:scyzkj123456@192.168.1.2:554/h264/ch1/main/av_stream",
+        "camera_ip": "",
+        "camera_check_interval": 5
+    },
+    DETECTION_PROFILE_OFFPOST: {
+        "video_url": "rtsp://admin:scyzkj123456@192.168.1.2:554/h264/ch1/main/av_stream",
+        "camera_ip": "",
+        "camera_check_interval": 5
+    },
+    DETECTION_PROFILE_DROWSY: {
+        "video_url": "rtsp://admin:scyzkj123456@192.168.1.2:554/h264/ch1/main/av_stream",
+        "camera_ip": "",
+        "camera_check_interval": 5
     }
 }
 
@@ -515,6 +534,51 @@ def apply_model_profile(profile):
     yolo_imgsz = imgsz_val
     if model_changed:
         load_model()
+
+
+def load_video_profile_config():
+    """加载按检测档案隔离的视频配置"""
+    global video_profile_config
+    if not os.path.exists(video_profile_config_file):
+        return
+    try:
+        with open(video_profile_config_file, 'r', encoding='utf-8') as f:
+            cfg = json.load(f)
+        for profile in [DETECTION_PROFILE_ZONE, DETECTION_PROFILE_OFFPOST, DETECTION_PROFILE_DROWSY]:
+            profile_cfg = cfg.get(profile, {})
+            video_profile_config[profile] = {
+                "video_url": profile_cfg.get("video_url", video_profile_config[profile]["video_url"]),
+                "camera_ip": profile_cfg.get("camera_ip", video_profile_config[profile]["camera_ip"]),
+                "camera_check_interval": int(profile_cfg.get("camera_check_interval", video_profile_config[profile]["camera_check_interval"]))
+            }
+        backend_logger.info(f"已从 {video_profile_config_file} 加载视频档案配置")
+    except Exception as e:
+        backend_logger.error(f"加载视频档案配置失败: {e}")
+
+
+def save_video_profile_config():
+    """保存按检测档案隔离的视频配置"""
+    try:
+        with open(video_profile_config_file, 'w', encoding='utf-8') as f:
+            json.dump(video_profile_config, f, indent=2, ensure_ascii=False)
+        backend_logger.info(f"视频档案配置已保存到 {video_profile_config_file}")
+    except Exception as e:
+        backend_logger.error(f"保存视频档案配置失败: {e}")
+
+
+def apply_video_profile(profile):
+    """应用指定档案的视频配置到当前运行时"""
+    global video_path, camera_ip, camera_check_interval
+    profile_cfg = video_profile_config.get(profile, {})
+    with video_lock:
+        video_path = profile_cfg.get("video_url", video_path)
+    with camera_status_lock:
+        camera_ip = profile_cfg.get("camera_ip", camera_ip)
+        try:
+            interval = int(profile_cfg.get("camera_check_interval", camera_check_interval))
+        except (TypeError, ValueError):
+            interval = camera_check_interval
+        camera_check_interval = max(1, interval)
 
 def load_model_classes(model_name):
     """加载模型对应的类别配置"""
@@ -949,6 +1013,11 @@ load_system_config()
 model_profile_config[DETECTION_PROFILE_ZONE]["model"] = current_model_name
 model_profile_config[DETECTION_PROFILE_ZONE]["imgsz"] = yolo_imgsz
 load_model_profile_config()
+video_profile_config[DETECTION_PROFILE_ZONE]["video_url"] = video_path
+video_profile_config[DETECTION_PROFILE_ZONE]["camera_ip"] = camera_ip
+video_profile_config[DETECTION_PROFILE_ZONE]["camera_check_interval"] = camera_check_interval
+load_video_profile_config()
+apply_video_profile(current_detection_profile)
 load_classes_config()
 load_display_config()
 load_alarm_config()
@@ -1388,6 +1457,34 @@ def video_reader():
     retry_count = 0
     max_retries = 5
     current_video_path = None
+
+    def get_capture_source(path):
+        """
+        将前端输入的视频源转换为 OpenCV 可识别的类型。
+        - "0" -> 0（本地摄像头 /dev/video0）
+        - 其他值保持原样（RTSP/文件路径）
+        """
+        if isinstance(path, str):
+            stripped = path.strip()
+            if stripped.isdigit():
+                return int(stripped)
+        return path
+
+    def open_video_capture(path):
+        """
+        打开视频源：
+        - 本地摄像头索引优先使用 V4L2（Jetson/Linux 更稳定）
+        - 失败时回退到 OpenCV 默认后端
+        """
+        source = get_capture_source(path)
+        if isinstance(source, int):
+            cap_v4l2 = cv2.VideoCapture(source, cv2.CAP_V4L2)
+            if cap_v4l2.isOpened():
+                backend_logger.info(f"使用V4L2打开本地摄像头成功: /dev/video{source}")
+                return cap_v4l2
+            cap_v4l2.release()
+            backend_logger.warning(f"V4L2打开本地摄像头失败，回退默认后端: /dev/video{source}")
+        return cv2.VideoCapture(source)
     
     while not stop_flag.is_set():
         # 检查视频路径是否改变
@@ -1400,7 +1497,7 @@ def video_reader():
         
         if cap is None or not cap.isOpened():
             backend_logger.info(f"正在连接视频流: {current_video_path}")
-            cap = cv2.VideoCapture(current_video_path)
+            cap = open_video_capture(current_video_path)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             
             if not cap.isOpened():
@@ -1977,6 +2074,7 @@ def ensure_detection_profile(profile):
 
     current_detection_profile = profile
     apply_model_profile(profile)
+    apply_video_profile(profile)
     load_zones_config(profile)
     load_alarm_config(profile)
     alarm_triggered.clear()
@@ -2527,8 +2625,12 @@ def set_model():
 
 
 @app.route('/api/video', methods=['GET'])
+@app.route('/api/offpost/video', methods=['GET'])
+@app.route('/api/drowsy/video', methods=['GET'])
 def get_video():
     """获取当前视频URL和摄像头状态"""
+    profile = get_profile_from_request_path(request.path)
+    ensure_detection_profile(profile)
     with video_lock:
         video_url = video_path
     with camera_status_lock:
@@ -2544,10 +2646,44 @@ def get_video():
     })
 
 
+@app.route('/api/video/local_cameras', methods=['GET'])
+def get_local_cameras():
+    """获取本机可用的本地摄像头列表（/dev/video*）"""
+    camera_list = []
+    try:
+        device_paths = sorted(glob.glob('/dev/video*'))
+        for device_path in device_paths:
+            match = re.search(r'/dev/video(\d+)$', device_path)
+            if not match:
+                continue
+            index = int(match.group(1))
+            cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
+            available = cap.isOpened()
+            cap.release()
+            camera_list.append({
+                "index": index,
+                "device": device_path,
+                "available": available
+            })
+
+        available_cameras = [c for c in camera_list if c["available"]]
+        return jsonify({
+            "success": True,
+            "cameras": available_cameras,
+            "all_cameras": camera_list
+        })
+    except Exception as e:
+        return jsonify({"success": False, "message": f"获取本地摄像头失败: {str(e)}", "cameras": []}), 500
+
+
 @app.route('/api/video', methods=['POST'])
+@app.route('/api/offpost/video', methods=['POST'])
+@app.route('/api/drowsy/video', methods=['POST'])
 def set_video():
     """设置视频URL、摄像头IP和检测间隔"""
     global video_path, camera_ip, camera_check_interval
+    profile = get_profile_from_request_path(request.path)
+    ensure_detection_profile(profile)
     
     data = request.json
     new_video_url = data.get('video_url')
@@ -2582,6 +2718,13 @@ def set_video():
                 if interval < 1:
                     interval = 1  # 最小1秒
                 camera_check_interval = interval
+
+        if profile not in video_profile_config:
+            video_profile_config[profile] = {}
+        video_profile_config[profile]["video_url"] = video_path
+        video_profile_config[profile]["camera_ip"] = camera_ip
+        video_profile_config[profile]["camera_check_interval"] = camera_check_interval
+        save_video_profile_config()
         
         save_system_config()
         

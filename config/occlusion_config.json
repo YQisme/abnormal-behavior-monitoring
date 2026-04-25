@@ -1,5 +1,5 @@
 {
-  "enabled": true,
+  "enabled": false,
   "check_interval": 5.0,
   "occlusion_threshold": 0.5
 }
