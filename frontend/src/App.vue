@@ -52,7 +52,7 @@ const defaultMonitorMenus = [
 
 const route = useRoute()
 const monitorMenus = ref([...defaultMonitorMenus])
-const hideSidebar = computed(() => route.path === '/login')
+const hideSidebar = computed(() => route.path === '/login' || route.path === '/')
 const activePath = computed(() => route.path)
 const visibleMonitorMenus = computed(() => monitorMenus.value.filter(item => item.visible))
 
