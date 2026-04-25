@@ -83,15 +83,26 @@
                       <LogPanel :logs="operationLogs" :auto-scroll="autoScrollOperationLogs" />
                     </div>
                   </el-tab-pane>
-                  <el-tab-pane label="系统日志" name="system">
+                  <el-tab-pane label="后端日志" name="backend">
                     <div class="log-container">
                       <div class="log-header">
-                        <el-button size="small" @click="clearLogs">清空日志</el-button>
-                        <el-checkbox v-model="autoScrollLogs" size="small" style="margin-left: 10px">
+                        <el-button size="small" @click="clearBackendLogs">清空日志</el-button>
+                        <el-checkbox v-model="autoScrollBackendLogs" size="small" style="margin-left: 10px">
                           自动滚动
                         </el-checkbox>
                       </div>
-                      <LogPanel :logs="logs" :auto-scroll="autoScrollLogs" />
+                      <LogPanel :logs="backendLogs" :auto-scroll="autoScrollBackendLogs" />
+                    </div>
+                  </el-tab-pane>
+                  <el-tab-pane label="推理日志" name="yolo">
+                    <div class="log-container">
+                      <div class="log-header">
+                        <el-button size="small" @click="clearYoloLogs">清空日志</el-button>
+                        <el-checkbox v-model="autoScrollYoloLogs" size="small" style="margin-left: 10px">
+                          自动滚动
+                        </el-checkbox>
+                      </div>
+                      <LogPanel :logs="yoloLogs" :auto-scroll="autoScrollYoloLogs" />
                     </div>
                   </el-tab-pane>
                 </el-tabs>
@@ -118,7 +129,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { io } from 'socket.io-client'
 import { ElMessage } from 'element-plus'
@@ -145,12 +156,21 @@ const zones = ref([])
 const zonesCount = ref(0)
 const alarms = ref([])
 const detections = ref([])
-const logs = ref([])  // 系统日志
-const operationLogs = ref([])  // 操作日志
-const autoScrollLogs = ref(true)
+const createModeLogs = () => ({
+  backend: [],
+  yolo: [],
+  operation: []
+})
+const logsByMode = ref({
+  zone: createModeLogs(),
+  offpost: createModeLogs(),
+  drowsy: createModeLogs()
+})
+const autoScrollBackendLogs = ref(true)
+const autoScrollYoloLogs = ref(true)
 const autoScrollOperationLogs = ref(true)
 const activeTopTab = ref('zones')  // 顶部标签：zones/logs/config
-const activeLogTab = ref('operation')  // 日志子标签：operation/system
+const activeLogTab = ref('operation')  // 日志子标签：operation/backend/yolo
 const activeInfoTab = ref('alarm')  // 信息标签：alarm/detection
 const videoPanelRef = ref(null)
 const loginEnabled = ref(true)  // 是否启用登录
@@ -158,6 +178,31 @@ const clearAlarmMqttLoading = ref(false)
 
 // Socket.IO 连接
 let socket = null
+
+const getCurrentModeKey = () => {
+  if (route.path === '/leave-monitor') {
+    return 'offpost'
+  }
+  if (route.path === '/drowsy-monitor') {
+    return 'drowsy'
+  }
+  return 'zone'
+}
+
+const getCurrentModeLogs = () => logsByMode.value[getCurrentModeKey()]
+const backendLogs = computed(() => getCurrentModeLogs().backend)
+const yoloLogs = computed(() => getCurrentModeLogs().yolo)
+const operationLogs = computed(() => getCurrentModeLogs().operation)
+
+const getModeKeyFromProfile = (profile) => {
+  if (profile === 'offpost_monitor') {
+    return 'offpost'
+  }
+  if (profile === 'drowsy_monitor') {
+    return 'drowsy'
+  }
+  return 'zone'
+}
 
 const refreshPageMode = () => {
   isLeaveMonitorMode.value = route.path === '/leave-monitor'
@@ -255,10 +300,30 @@ onMounted(() => {
   })
 
   socket.on('log', (data) => {
-    // 系统日志
-    logs.value.push(data)
-    if (logs.value.length > 1000) {
-      logs.value.shift()
+    // 系统日志按日志自带的监测模式分流，避免离岗/瞌睡/区域报警日志重叠
+    const targetModeKey = getModeKeyFromProfile(data?.profile)
+    const targetModeLogs = logsByMode.value[targetModeKey]
+    const loggerName = String(data?.logger || '').toLowerCase()
+    if (loggerName === 'backend') {
+      targetModeLogs.backend.push(data)
+      if (targetModeLogs.backend.length > 1000) {
+        targetModeLogs.backend.shift()
+      }
+      return
+    }
+
+    if (loggerName === 'yolo' || loggerName === 'ultralytics') {
+      targetModeLogs.yolo.push(data)
+      if (targetModeLogs.yolo.length > 1000) {
+        targetModeLogs.yolo.shift()
+      }
+      return
+    }
+
+    // 未知来源默认归入后端日志，避免日志丢失
+    targetModeLogs.backend.push(data)
+    if (targetModeLogs.backend.length > 1000) {
+      targetModeLogs.backend.shift()
     }
   })
 })
@@ -308,8 +373,12 @@ const handleZoneUpdated = () => {
   addOperationLog('区域配置已更新', 'INFO')
 }
 
-const clearLogs = () => {
-  logs.value = []
+const clearBackendLogs = () => {
+  getCurrentModeLogs().backend = []
+}
+
+const clearYoloLogs = () => {
+  getCurrentModeLogs().yolo = []
 }
 
 // 清除报警信息：向 MQTT 发送 isOffline/isOccluded/hasPeople 的 0 消息
@@ -333,20 +402,21 @@ const clearAlarmMqtt = async () => {
 }
 
 const clearOperationLogs = () => {
-  operationLogs.value = []
+  getCurrentModeLogs().operation = []
 }
 
 // 记录操作日志
 const addOperationLog = (message, level = 'INFO') => {
   const timestamp = new Date().toLocaleString('zh-CN')
-  operationLogs.value.push({
+  const currentModeLogs = getCurrentModeLogs()
+  currentModeLogs.operation.push({
     timestamp,
     level,
     message,
     logger: 'operation'
   })
-  if (operationLogs.value.length > 1000) {
-    operationLogs.value.shift()
+  if (currentModeLogs.operation.length > 1000) {
+    currentModeLogs.operation.shift()
   }
 }
 

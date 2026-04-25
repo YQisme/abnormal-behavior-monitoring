@@ -68,6 +68,9 @@ def log_sender():
     while not stop_flag.is_set():
         try:
             log_entry = log_queue.get(timeout=1)
+            # 为每条日志附带当前检测档案，前端可按档案分流展示
+            if isinstance(log_entry, dict):
+                log_entry['profile'] = globals().get('current_detection_profile', 'zone_alarm')
             # 使用socketio.emit发送日志，room=None表示广播给所有连接的客户端
             socketio.emit('log', log_entry, room=None)
         except queue.Empty:
