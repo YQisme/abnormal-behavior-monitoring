@@ -6,5 +6,9 @@
   "offpost_monitor": {
     "model": "yolo11m.pt",
     "imgsz": 640
+  },
+  "drowsy_monitor": {
+    "model": "yolo26m_640_fp32.engine",
+    "imgsz": 640
   }
 }

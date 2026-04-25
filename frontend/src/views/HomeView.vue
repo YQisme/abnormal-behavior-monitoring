@@ -6,6 +6,7 @@
       <div class="nav-actions">
         <el-button type="primary" size="large" @click="go('/zone-alarm')">区域报警</el-button>
         <el-button type="warning" size="large" @click="go('/leave-monitor')">离岗监测</el-button>
+        <el-button type="success" size="large" @click="go('/drowsy-monitor')">瞌睡监测</el-button>
       </div>
     </div>
   </div>

@@ -20,6 +20,10 @@
           <el-icon><UserFilled /></el-icon>
           <span>离岗监测</span>
         </el-menu-item>
+        <el-menu-item index="/drowsy-monitor">
+          <el-icon><CoffeeCup /></el-icon>
+          <span>瞌睡监测</span>
+        </el-menu-item>
       </el-menu>
     </el-aside>
     <el-main class="main-view">

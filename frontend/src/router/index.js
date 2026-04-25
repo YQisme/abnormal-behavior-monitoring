@@ -31,6 +31,12 @@ const routes = [
     meta: { requiresAuth: true }
   },
   {
+    path: '/drowsy-monitor',
+    name: 'DrowsyMonitor',
+    component: MainView,
+    meta: { requiresAuth: true }
+  },
+  {
     path: '/monitor',
     name: 'Monitor',
     component: VideoMonitor,

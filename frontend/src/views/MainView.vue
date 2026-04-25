@@ -132,6 +132,7 @@ import ZoneManager from '../components/ZoneManager.vue'
 const router = useRouter()
 const route = useRoute()
 const isLeaveMonitorMode = ref(false)
+const isDrowsyMonitorMode = ref(false)
 const pageTitle = ref('人员检测与区域报警系统')
 const videoPanelTitle = ref('区域报警')
 const zoneTabLabel = ref('区域管理')
@@ -159,10 +160,25 @@ let socket = null
 
 const refreshPageMode = () => {
   isLeaveMonitorMode.value = route.path === '/leave-monitor'
-  pageTitle.value = isLeaveMonitorMode.value ? '人员检测与离岗监测系统' : '人员检测与区域报警系统'
-  videoPanelTitle.value = isLeaveMonitorMode.value ? '离岗监测' : '区域报警'
-  zoneTabLabel.value = isLeaveMonitorMode.value ? '离岗区域管理' : '区域管理'
-  alarmApiPrefix.value = isLeaveMonitorMode.value ? '/api/offpost' : '/api'
+  isDrowsyMonitorMode.value = route.path === '/drowsy-monitor'
+  if (isLeaveMonitorMode.value) {
+    pageTitle.value = '人员检测与离岗监测系统'
+    videoPanelTitle.value = '离岗监测'
+    zoneTabLabel.value = '离岗区域管理'
+    alarmApiPrefix.value = '/api/offpost'
+    return
+  }
+  if (isDrowsyMonitorMode.value) {
+    pageTitle.value = '人员检测与瞌睡监测系统'
+    videoPanelTitle.value = '瞌睡监测'
+    zoneTabLabel.value = '瞌睡区域管理'
+    alarmApiPrefix.value = '/api/drowsy'
+    return
+  }
+  pageTitle.value = '人员检测与区域报警系统'
+  videoPanelTitle.value = '区域报警'
+  zoneTabLabel.value = '区域管理'
+  alarmApiPrefix.value = '/api'
 }
 
 onMounted(() => {

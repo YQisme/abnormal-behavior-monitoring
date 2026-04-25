@@ -165,6 +165,7 @@ latest_annotated_frame = None  # 最新处理后的帧（包含YOLO检测结果�
 # 检测配置档案（用于“区域报警/离岗监测”两套独立配置）
 DETECTION_PROFILE_ZONE = "zone_alarm"
 DETECTION_PROFILE_OFFPOST = "offpost_monitor"
+DETECTION_PROFILE_DROWSY = "drowsy_monitor"
 DETECTION_PROFILE_FILES = {
     DETECTION_PROFILE_ZONE: {
         "zones": zones_config_file,
@@ -173,6 +174,10 @@ DETECTION_PROFILE_FILES = {
     DETECTION_PROFILE_OFFPOST: {
         "zones": os.path.join(CONFIG_DIR, "offpost_zones_config.json"),
         "alarm": os.path.join(CONFIG_DIR, "offpost_alarm_config.json")
+    },
+    DETECTION_PROFILE_DROWSY: {
+        "zones": os.path.join(CONFIG_DIR, "drowsy_zones_config.json"),
+        "alarm": os.path.join(CONFIG_DIR, "drowsy_alarm_config.json")
     }
 }
 current_detection_profile = DETECTION_PROFILE_ZONE
@@ -183,6 +188,10 @@ model_profile_config = {
         "imgsz": 640
     },
     DETECTION_PROFILE_OFFPOST: {
+        "model": "yolo26m_640_int8.engine",
+        "imgsz": 640
+    },
+    DETECTION_PROFILE_DROWSY: {
         "model": "yolo26m_640_int8.engine",
         "imgsz": 640
     }
@@ -472,7 +481,7 @@ def load_model_profile_config():
     try:
         with open(model_profile_config_file, 'r', encoding='utf-8') as f:
             cfg = json.load(f)
-        for profile in [DETECTION_PROFILE_ZONE, DETECTION_PROFILE_OFFPOST]:
+        for profile in [DETECTION_PROFILE_ZONE, DETECTION_PROFILE_OFFPOST, DETECTION_PROFILE_DROWSY]:
             profile_cfg = cfg.get(profile, {})
             model_profile_config[profile] = {
                 "model": profile_cfg.get("model", model_profile_config[profile]["model"]),
@@ -1975,6 +1984,15 @@ def ensure_detection_profile(profile):
     backend_logger.info(f"检测档案已切换: {profile}")
 
 
+def get_profile_from_request_path(path):
+    """根据请求路径识别检测档案"""
+    if path.startswith('/api/offpost/'):
+        return DETECTION_PROFILE_OFFPOST
+    if path.startswith('/api/drowsy/'):
+        return DETECTION_PROFILE_DROWSY
+    return DETECTION_PROFILE_ZONE
+
+
 # 加载已保存的区域配置
 load_zones_config()
 
@@ -2151,9 +2169,10 @@ def index():
 # REST API 路由 - 多区域管理
 @app.route('/api/zones', methods=['GET'])
 @app.route('/api/offpost/zones', methods=['GET'])
+@app.route('/api/drowsy/zones', methods=['GET'])
 def get_zones():
     """获取所有区域"""
-    profile = DETECTION_PROFILE_OFFPOST if request.path.startswith('/api/offpost/') else DETECTION_PROFILE_ZONE
+    profile = get_profile_from_request_path(request.path)
     ensure_detection_profile(profile)
     return jsonify({
         "zones": zones,
@@ -2163,10 +2182,11 @@ def get_zones():
 
 @app.route('/api/zones', methods=['POST'])
 @app.route('/api/offpost/zones', methods=['POST'])
+@app.route('/api/drowsy/zones', methods=['POST'])
 def create_zone():
     """创建新区域"""
     global zones, next_zone_id
-    profile = DETECTION_PROFILE_OFFPOST if request.path.startswith('/api/offpost/') else DETECTION_PROFILE_ZONE
+    profile = get_profile_from_request_path(request.path)
     ensure_detection_profile(profile)
     
     data = request.json
@@ -2205,9 +2225,10 @@ def create_zone():
 
 @app.route('/api/zones/<zone_id>', methods=['GET'])
 @app.route('/api/offpost/zones/<zone_id>', methods=['GET'])
+@app.route('/api/drowsy/zones/<zone_id>', methods=['GET'])
 def get_zone(zone_id):
     """获取指定区域"""
-    profile = DETECTION_PROFILE_OFFPOST if request.path.startswith('/api/offpost/') else DETECTION_PROFILE_ZONE
+    profile = get_profile_from_request_path(request.path)
     ensure_detection_profile(profile)
     zone = next((z for z in zones if z.get('id') == zone_id), None)
     if zone:
@@ -2218,10 +2239,11 @@ def get_zone(zone_id):
 
 @app.route('/api/zones/<zone_id>', methods=['PUT'])
 @app.route('/api/offpost/zones/<zone_id>', methods=['PUT'])
+@app.route('/api/drowsy/zones/<zone_id>', methods=['PUT'])
 def update_zone(zone_id):
     """更新区域"""
     global zones
-    profile = DETECTION_PROFILE_OFFPOST if request.path.startswith('/api/offpost/') else DETECTION_PROFILE_ZONE
+    profile = get_profile_from_request_path(request.path)
     ensure_detection_profile(profile)
     
     zone = next((z for z in zones if z.get('id') == zone_id), None)
@@ -2254,10 +2276,11 @@ def update_zone(zone_id):
 
 @app.route('/api/zones/<zone_id>', methods=['DELETE'])
 @app.route('/api/offpost/zones/<zone_id>', methods=['DELETE'])
+@app.route('/api/drowsy/zones/<zone_id>', methods=['DELETE'])
 def delete_zone(zone_id):
     """删除区域"""
     global zones, alarm_triggered
-    profile = DETECTION_PROFILE_OFFPOST if request.path.startswith('/api/offpost/') else DETECTION_PROFILE_ZONE
+    profile = get_profile_from_request_path(request.path)
     ensure_detection_profile(profile)
     
     zone = next((z for z in zones if z.get('id') == zone_id), None)
@@ -2279,10 +2302,11 @@ def delete_zone(zone_id):
 
 @app.route('/api/zones/<zone_id>/rename', methods=['POST'])
 @app.route('/api/offpost/zones/<zone_id>/rename', methods=['POST'])
+@app.route('/api/drowsy/zones/<zone_id>/rename', methods=['POST'])
 def rename_zone(zone_id):
     """重命名区域"""
     global zones
-    profile = DETECTION_PROFILE_OFFPOST if request.path.startswith('/api/offpost/') else DETECTION_PROFILE_ZONE
+    profile = get_profile_from_request_path(request.path)
     ensure_detection_profile(profile)
     
     zone = next((z for z in zones if z.get('id') == zone_id), None)
@@ -2393,9 +2417,10 @@ def set_inference_config():
 
 @app.route('/api/models', methods=['GET'])
 @app.route('/api/offpost/models', methods=['GET'])
+@app.route('/api/drowsy/models', methods=['GET'])
 def get_models():
     """获取可用的模型列表"""
-    profile = DETECTION_PROFILE_OFFPOST if request.path.startswith('/api/offpost/') else DETECTION_PROFILE_ZONE
+    profile = get_profile_from_request_path(request.path)
     try:
         profile_cfg = model_profile_config.get(profile, {})
         profile_model = profile_cfg.get("model", current_model_name)
@@ -2420,10 +2445,11 @@ def get_models():
 
 @app.route('/api/model', methods=['POST'])
 @app.route('/api/offpost/model', methods=['POST'])
+@app.route('/api/drowsy/model', methods=['POST'])
 def set_model():
     """切换模型或更新推理配置（如 imgsz）"""
     global current_model_name, model, yolo_imgsz
-    profile = DETECTION_PROFILE_OFFPOST if request.path.startswith('/api/offpost/') else DETECTION_PROFILE_ZONE
+    profile = get_profile_from_request_path(request.path)
     if profile not in model_profile_config:
         model_profile_config[profile] = {"model": current_model_name, "imgsz": yolo_imgsz}
     
@@ -3358,18 +3384,20 @@ def preview_recording_video(filename):
 
 @app.route('/api/alarm', methods=['GET'])
 @app.route('/api/offpost/alarm', methods=['GET'])
+@app.route('/api/drowsy/alarm', methods=['GET'])
 def get_alarm_config():
     """获取报警配置"""
-    profile = DETECTION_PROFILE_OFFPOST if request.path.startswith('/api/offpost/') else DETECTION_PROFILE_ZONE
+    profile = get_profile_from_request_path(request.path)
     ensure_detection_profile(profile)
     return jsonify(alarm_config)
 
 @app.route('/api/alarm', methods=['POST'])
 @app.route('/api/offpost/alarm', methods=['POST'])
+@app.route('/api/drowsy/alarm', methods=['POST'])
 def set_alarm_config():
     """设置报警配置"""
     global alarm_config
-    profile = DETECTION_PROFILE_OFFPOST if request.path.startswith('/api/offpost/') else DETECTION_PROFILE_ZONE
+    profile = get_profile_from_request_path(request.path)
     ensure_detection_profile(profile)
     
     data = request.json
