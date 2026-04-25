@@ -405,6 +405,18 @@
               同一目标在此时间内只报警一次
             </span>
           </el-form-item>
+          <el-form-item v-if="isOffpostMode" label="无人持续报警时长（秒）">
+            <el-input-number
+              v-model="alarmForm.offpost_absence_duration"
+              :min="0"
+              :max="3600"
+              :step="0.5"
+              :precision="1"
+            />
+            <span style="margin-left: 10px; color: #666; font-size: 12px">
+              离岗监测中，连续未检测到人达到该时长后触发报警
+            </span>
+          </el-form-item>
           <el-form-item label="检测模式">
             <el-select v-model="alarmForm.detection_mode" style="width: 100%">
               <el-option
@@ -487,7 +499,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, watch, onUnmounted } from 'vue'
+import { ref, onMounted, watch, onUnmounted, computed } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { CircleCheck, CircleClose, QuestionFilled } from '@element-plus/icons-vue'
 import axios from 'axios'
@@ -511,6 +523,7 @@ const emit = defineEmits(['model-changed', 'video-changed', 'classes-changed', '
 
 const activeTab = ref('model')
 const isTabVisible = (tabName) => props.visibleTabs.includes(tabName)
+const isOffpostMode = computed(() => props.alarmApiPrefix === '/api/offpost')
 
 const resolveActiveTab = (preferredTab) => {
   if (isTabVisible(preferredTab)) {
@@ -550,6 +563,7 @@ const displayForm = ref({
 })
 const alarmForm = ref({
   debounce_time: 5.0,
+  offpost_absence_duration: 10.0,
   detection_mode: 'center',
   once_per_id: false,
   save_event_video: true,
@@ -915,6 +929,9 @@ const loadAlarmConfig = async () => {
     const res = await axios.get(`${props.alarmApiPrefix}/alarm`)
     if (res.data.debounce_time !== undefined) {
       alarmForm.value.debounce_time = res.data.debounce_time
+    }
+    if (res.data.offpost_absence_duration !== undefined) {
+      alarmForm.value.offpost_absence_duration = res.data.offpost_absence_duration
     }
     if (res.data.detection_mode !== undefined) {
       alarmForm.value.detection_mode = res.data.detection_mode
@@ -1351,6 +1368,7 @@ const applyAlarm = async () => {
   try {
     const res = await axios.post(`${props.alarmApiPrefix}/alarm`, {
       debounce_time: alarmForm.value.debounce_time,
+      offpost_absence_duration: alarmForm.value.offpost_absence_duration,
       detection_mode: alarmForm.value.detection_mode,
       once_per_id: alarmForm.value.once_per_id,
       save_event_video: alarmForm.value.save_event_video,

@@ -239,6 +239,10 @@ onMounted(() => {
   })
 
   socket.on('alarm', (data) => {
+    // 离岗监测模式下忽略“有人进入区域”的报警，只保留持续无人报警
+    if (isLeaveMonitorMode.value && (data?.alarm_type === 'zone' || !data?.alarm_type)) {
+      return
+    }
     console.log('报警:', data)
     alarms.value.unshift(data)
     if (alarms.value.length > 20) {

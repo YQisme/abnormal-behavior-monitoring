@@ -1,0 +1,9 @@
+{
+  "debounce_time": 5.0,
+  "detection_mode": "center",
+  "once_per_id": false,
+  "save_event_video": false,
+  "save_event_image": false,
+  "event_video_duration": 10,
+  "event_save_path": "/home/yzkj/abnormal-behavior-monitoring/alarm_events"
+}

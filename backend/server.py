@@ -111,10 +111,13 @@ zones = []  # 区域列表，格式：[{"id": "uuid", "name": "区域1", "points
 next_zone_id = 1  # 下一个区域ID（用于生成唯一ID）
 alarm_triggered = {}  # 记录已触发报警的跟踪ID，格式：{(track_id, class_id, zone_id): timestamp}
 zone_has_people_mqtt_sent = False  # 是否已发送过 hasPeople:1，用于恢复时发送 hasPeople:0
+offpost_last_seen_person_ts = time.time()  # 离岗监测：最近一次检测到人的时间戳
+offpost_absence_alarm_sent = False  # 离岗监测：当前无人告警是否已触发
 
 # 报警配置
 alarm_config = {
     "debounce_time": 5.0,  # 防抖时间（秒），同一目标在此时间内只报警一次
+    "offpost_absence_duration": 10.0,  # 离岗监测：持续无人多久后报警（秒）
     "detection_mode": "center",  # 检测模式："center"=中心点，"edge"=边框任意点
     "once_per_id": False,  # 相同ID是否只报警一次（True=整个生命周期只报警一次，False=允许重复报警）
     "save_event_video": True,  # 是否保存报警事件视频
@@ -768,6 +771,7 @@ def load_alarm_config(profile=None):
 
     alarm_config = {
         "debounce_time": 5.0,
+        "offpost_absence_duration": 10.0,
         "detection_mode": "center",
         "once_per_id": False,
         "save_event_video": True,
@@ -784,6 +788,8 @@ def load_alarm_config(profile=None):
                     alarm_config['debounce_time'] = float(config['debounce_time'])
                 if 'detection_mode' in config:
                     alarm_config['detection_mode'] = config['detection_mode']
+                if 'offpost_absence_duration' in config:
+                    alarm_config['offpost_absence_duration'] = max(0.0, float(config['offpost_absence_duration']))
                 if 'once_per_id' in config:
                     alarm_config['once_per_id'] = bool(config['once_per_id'])
                 if 'save_event_video' in config:
@@ -1391,6 +1397,9 @@ def occlusion_detector():
 def trigger_alarm(track_id, bbox_center, zone_id, zone_name, class_id=None, class_name_cn=None):
     """触发报警"""
     global alarm_triggered, zone_has_people_mqtt_sent, alarm_config
+    # 离岗监测模式下不应触发“有人进入区域”报警，避免误报与错误文案
+    if current_detection_profile == DETECTION_PROFILE_OFFPOST:
+        return False
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
     # 使用 (track_id, class_id, zone_id) 作为唯一标识，避免不同类别和区域的相同ID冲突
@@ -1448,6 +1457,36 @@ def trigger_alarm(track_id, bbox_center, zone_id, zone_name, class_id=None, clas
     send_mqtt_message({"hasPeople": 1})
     zone_has_people_mqtt_sent = True
     
+    return True
+
+
+def trigger_offpost_absence_alarm(absence_duration, zone_name='当前区域'):
+    """离岗监测：持续无人触发报警"""
+    global offpost_absence_alarm_sent, zone_has_people_mqtt_sent
+    if offpost_absence_alarm_sent:
+        return False
+
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    alarm_data = {
+        "time": current_time,
+        "track_id": -1,
+        "class_id": None,
+        "class_name_cn": "人员离岗",
+        "object_name": "人员离岗",
+        "zone_id": "offpost",
+        "zone_name": zone_name,
+        "position": {"x": 0.0, "y": 0.0},
+        "event_video": None,
+        "event_image": None,
+        "absence_duration": round(float(absence_duration), 2),
+        "alarm_type": "offpost_absence"
+    }
+
+    socketio.emit('alarm', alarm_data)
+    backend_logger.warning(f"⚠️  离岗报警！区域【{zone_name}】已持续无人 {absence_duration:.2f} 秒，时间: {current_time}")
+    send_mqtt_message({"hasPeople": 0})
+    zone_has_people_mqtt_sent = False
+    offpost_absence_alarm_sent = True
     return True
 
 
@@ -1547,7 +1586,7 @@ def video_reader():
 
 def detection_worker():
     """检测工作线程"""
-    global latest_frame, latest_results, latest_annotated_frame, zones, fps_counter, display_config, zone_has_people_mqtt_sent, inference_running
+    global latest_frame, latest_results, latest_annotated_frame, zones, fps_counter, display_config, zone_has_people_mqtt_sent, inference_running, offpost_last_seen_person_ts, offpost_absence_alarm_sent
     
     while not stop_flag.is_set():
         try:
@@ -1651,15 +1690,31 @@ def detection_worker():
                                     
                                     if in_zone:
                                         person_in_zone_this_frame = True
-                                        track_id = int(track_ids[i])
-                                        class_name_cn = get_class_name_cn(cls_id)
-                                        trigger_alarm(track_id, bbox_center, zone_id, zone_name, cls_id, class_name_cn)
+                                        if current_detection_profile != DETECTION_PROFILE_OFFPOST:
+                                            track_id = int(track_ids[i])
+                                            class_name_cn = get_class_name_cn(cls_id)
+                                            trigger_alarm(track_id, bbox_center, zone_id, zone_name, cls_id, class_name_cn)
                                         if not no_zone_mode:
                                             break  # 区域模式下只对第一个匹配的区域报警
-                # 本帧无人进入任何区域且此前已发送过 hasPeople:1 时，发送恢复消息
-                if not person_in_zone_this_frame and zone_has_people_mqtt_sent:
-                    send_mqtt_message({"hasPeople": 0})
-                    zone_has_people_mqtt_sent = False
+                if current_detection_profile == DETECTION_PROFILE_OFFPOST:
+                    current_ts = time.time()
+                    if person_in_zone_this_frame:
+                        offpost_last_seen_person_ts = current_ts
+                        offpost_absence_alarm_sent = False
+                        if not zone_has_people_mqtt_sent:
+                            send_mqtt_message({"hasPeople": 1})
+                            zone_has_people_mqtt_sent = True
+                    else:
+                        absence_duration = current_ts - offpost_last_seen_person_ts
+                        threshold = float(alarm_config.get('offpost_absence_duration', 10.0))
+                        if absence_duration >= threshold:
+                            target_zone_name = enabled_zones[0].get('name', '当前区域') if enabled_zones else '当前区域'
+                            trigger_offpost_absence_alarm(absence_duration, target_zone_name)
+                else:
+                    # 本帧无人进入任何区域且此前已发送过 hasPeople:1 时，发送恢复消息
+                    if not person_in_zone_this_frame and zone_has_people_mqtt_sent:
+                        send_mqtt_message({"hasPeople": 0})
+                        zone_has_people_mqtt_sent = False
             
             # 手动绘制检测框（只显示启用的类别）
             annotated_frame = frame.copy()
@@ -2065,7 +2120,7 @@ def save_zones_config(profile=None):
 
 def ensure_detection_profile(profile):
     """切换并加载指定检测档案配置"""
-    global current_detection_profile, alarm_triggered, zone_has_people_mqtt_sent
+    global current_detection_profile, alarm_triggered, zone_has_people_mqtt_sent, offpost_last_seen_person_ts, offpost_absence_alarm_sent
 
     if profile not in DETECTION_PROFILE_FILES:
         raise ValueError("未知检测档案")
@@ -2079,6 +2134,8 @@ def ensure_detection_profile(profile):
     load_alarm_config(profile)
     alarm_triggered.clear()
     zone_has_people_mqtt_sent = False
+    offpost_last_seen_person_ts = time.time()
+    offpost_absence_alarm_sent = False
     backend_logger.info(f"检测档案已切换: {profile}")
 
 
@@ -3551,6 +3608,12 @@ def set_alarm_config():
             if debounce_time < 0:
                 return jsonify({"success": False, "message": "防抖时间不能为负数"}), 400
             alarm_config['debounce_time'] = debounce_time
+
+        if 'offpost_absence_duration' in data:
+            offpost_absence_duration = float(data['offpost_absence_duration'])
+            if offpost_absence_duration < 0:
+                return jsonify({"success": False, "message": "离岗无人报警时长不能为负数"}), 400
+            alarm_config['offpost_absence_duration'] = offpost_absence_duration
         
         if 'detection_mode' in data:
             detection_mode = data['detection_mode']

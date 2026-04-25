@@ -38,6 +38,19 @@
             <br>
             <span class="alarm-desc">检测到画面被遮挡，请检查摄像头</span>
           </template>
+          
+          <!-- 离岗报警格式 -->
+          <template v-else-if="alarm.alarm_type === 'offpost_absence'">
+            <span class="alarm-icon">👤</span>
+            <span class="alarm-title">人员离岗</span>
+            <span class="alarm-detail" v-if="alarm.zone_name"> - 区域: 【{{ alarm.zone_name }}】</span>
+            <br>
+            <span class="alarm-desc">
+              连续无人
+              {{ alarm.absence_duration !== undefined ? `${Number(alarm.absence_duration).toFixed(1)} 秒` : '' }}
+              ，已触发离岗报警
+            </span>
+          </template>
         </div>
       </div>
     </el-scrollbar>
@@ -59,6 +72,8 @@ const getAlarmTypeClass = (alarmType) => {
       return 'alarm-camera-offline'
     case 'occlusion':
       return 'alarm-occlusion'
+    case 'offpost_absence':
+      return 'alarm-offpost'
     case 'zone':
     default:
       return 'alarm-zone'
@@ -95,6 +110,12 @@ const getAlarmTypeClass = (alarmType) => {
 .alarm-occlusion {
   border-left: 4px solid #f0a020;
   background: #fef9e7;
+}
+
+/* 离岗报警 - 紫色 */
+.alarm-offpost {
+  border-left: 4px solid #7c3aed;
+  background: #f5f3ff;
 }
 
 @keyframes slideIn {
@@ -156,6 +177,10 @@ const getAlarmTypeClass = (alarmType) => {
 
 .alarm-occlusion .alarm-title {
   color: #f0a020;
+}
+
+.alarm-offpost .alarm-title {
+  color: #7c3aed;
 }
 
 .alarm-detail {
