@@ -67,7 +67,7 @@
             :timestamp="formatTime(event.occurred_at)"
             placement="top"
           >
-            <el-card class="event-card" shadow="never">
+            <el-card class="event-card" :class="{ 'event-card-target': isTargetEvent(event) }" shadow="never" :data-event-id="event.event_id">
               <template #header>
                 <div class="event-header">
                   <div class="event-tags">
@@ -144,7 +144,7 @@
             :md="12"
             :lg="8"
           >
-            <el-card class="event-card grid-card" shadow="never">
+            <el-card class="event-card grid-card" :class="{ 'event-card-target': isTargetEvent(event) }" shadow="never" :data-event-id="event.event_id">
               <template #header>
                 <div class="event-header">
                   <div class="event-tags">
@@ -201,9 +201,10 @@
 </template>
 
 <script setup>
-import { computed, ref, onMounted } from 'vue'
+import { computed, ref, onMounted, nextTick } from 'vue'
 import axios from 'axios'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { useRoute } from 'vue-router'
 
 const loading = ref(false)
 const selectedEventType = ref('all')
@@ -212,6 +213,8 @@ const storage = ref(null)
 const viewMode = ref('timeline')
 const timeRange = ref([])
 const selectedMediaPaths = ref([])
+const targetEventId = ref('')
+const route = useRoute()
 
 const fetchEvents = async () => {
   loading.value = true
@@ -239,6 +242,8 @@ const fetchEvents = async () => {
     ElMessage.error(error.response?.data?.message || '获取报警事件失败')
   } finally {
     loading.value = false
+    await nextTick()
+    scrollToTargetEvent()
   }
 }
 
@@ -292,6 +297,18 @@ const eventTypeLabel = (type) => {
   if (type === 'offpost') return '离岗报警'
   if (type === 'drowsy') return '瞌睡报警'
   return '其他'
+}
+
+const isTargetEvent = (event) => {
+  if (!targetEventId.value) return false
+  return (event?.event_id || '') === targetEventId.value
+}
+
+const scrollToTargetEvent = () => {
+  if (!targetEventId.value) return
+  const targetEl = document.querySelector(`[data-event-id="${targetEventId.value}"]`)
+  if (!targetEl) return
+  targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' })
 }
 
 const handleDeleteSingle = async (media) => {
@@ -418,6 +435,15 @@ const handleBatchDelete = async () => {
 }
 
 onMounted(() => {
+  const queryEventType = String(route.query.event_type || '').trim()
+  if (queryEventType && ['all', 'zone', 'offpost', 'drowsy', 'unknown'].includes(queryEventType)) {
+    selectedEventType.value = queryEventType
+  }
+  const queryView = String(route.query.view || '').trim()
+  if (queryView && ['timeline', 'grid', 'document'].includes(queryView)) {
+    viewMode.value = queryView
+  }
+  targetEventId.value = String(route.query.eventId || '').trim()
   fetchEvents()
 })
 </script>
@@ -467,6 +493,11 @@ onMounted(() => {
 
 .event-card {
   border: 1px solid #ebeef5;
+}
+
+.event-card-target {
+  border-color: #409eff;
+  box-shadow: 0 0 0 2px rgba(64, 158, 255, 0.25);
 }
 
 .event-header {

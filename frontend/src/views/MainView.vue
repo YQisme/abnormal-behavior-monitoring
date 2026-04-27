@@ -24,7 +24,10 @@
           <div v-if="flashConfirmVisible" class="flash-confirm-card">
             <div class="flash-confirm-title">声光报警</div>
             <div class="flash-confirm-text">{{ flashConfirmText }}</div>
-            <el-button type="danger" @click="confirmFlashAlarm">确认关闭报警</el-button>
+            <div class="flash-confirm-actions">
+              <el-button @click="goToAlarmReplay">查看回放</el-button>
+              <el-button type="danger" @click="confirmFlashAlarm">关闭报警</el-button>
+            </div>
           </div>
         </div>
         <!-- 上方：视频 + 监控信息 -->
@@ -185,6 +188,7 @@ const clearAlarmMqttLoading = ref(false)
 const flashRedActive = ref(false)
 const flashConfirmVisible = ref(false)
 const flashConfirmText = ref('')
+const flashConfirmAlarm = ref(null)
 let flashConfirmResolver = null
 let alarmActionRunning = false
 const pendingAlarmQueue = []
@@ -407,16 +411,18 @@ const buildAlarmText = (alarm) => {
   return `${normalizeObjectName(alarm?.class_name_cn || alarm?.object_name)}进入监控区域${zoneName}`
 }
 
-const triggerFlashRed = (text, needManualConfirm) => {
+const triggerFlashRed = (text, needManualConfirm, alarm = null) => {
   flashRedActive.value = true
   flashConfirmText.value = text
   flashConfirmVisible.value = !!needManualConfirm
+  flashConfirmAlarm.value = needManualConfirm ? alarm : null
 }
 
 const closeFlashRed = () => {
   flashRedActive.value = false
   flashConfirmVisible.value = false
   flashConfirmText.value = ''
+  flashConfirmAlarm.value = null
 }
 
 const waitFlashConfirm = () => new Promise((resolve) => {
@@ -429,6 +435,87 @@ const confirmFlashAlarm = () => {
     flashConfirmResolver = null
   }
   closeFlashRed()
+}
+
+const buildAlarmEventType = (alarmType) => {
+  if (alarmType === 'offpost_absence' || alarmType === 'offpost_recovery') return 'offpost'
+  if (alarmType === 'drowsy') return 'drowsy'
+  if (alarmType === 'zone') return 'zone'
+  return 'unknown'
+}
+
+const buildAlarmEventId = (alarm) => {
+  const eventFile = alarm?.event_video || alarm?.event_image
+  if (!eventFile) return ''
+  const stem = String(eventFile).replace(/\.[^.]+$/, '')
+  if (!stem) return ''
+  return `${buildAlarmEventType(alarm?.alarm_type)}:${stem}`
+}
+
+const parseAlarmTimestamp = (alarm) => {
+  const raw = String(alarm?.time || '').trim()
+  if (!raw) return 0
+  const ms = Date.parse(raw.replace(' ', 'T'))
+  return Number.isNaN(ms) ? 0 : ms / 1000
+}
+
+const findFallbackEventId = async (alarm) => {
+  const eventType = buildAlarmEventType(alarm?.alarm_type)
+  const queryEventType = eventType === 'unknown' ? 'all' : eventType
+  try {
+    const res = await axios.get('/api/alarm-events', {
+      params: {
+        limit: 80,
+        event_type: queryEventType
+      }
+    })
+    if (!res.data?.success) return ''
+    const grouped = res.data?.grouped_timeline || {}
+    const events = Object.values(grouped).flat()
+    if (!Array.isArray(events) || events.length === 0) return ''
+    const alarmTs = parseAlarmTimestamp(alarm)
+    const alarmZone = String(alarm?.zone_name || '').trim()
+    const alarmTrack = String(alarm?.track_id ?? '').trim()
+    const sorted = [...events].sort((a, b) => {
+      const aDoc = a?.document || {}
+      const bDoc = b?.document || {}
+      const aZone = String(aDoc.zone_name || '').trim()
+      const bZone = String(bDoc.zone_name || '').trim()
+      const aTrack = String(aDoc.track_id ?? '').trim()
+      const bTrack = String(bDoc.track_id ?? '').trim()
+      const aTs = Number(a?.occurred_at || 0)
+      const bTs = Number(b?.occurred_at || 0)
+      const aScore = (alarmZone && aZone === alarmZone ? 2 : 0) + (alarmTrack && aTrack === alarmTrack ? 2 : 0)
+      const bScore = (alarmZone && bZone === alarmZone ? 2 : 0) + (alarmTrack && bTrack === alarmTrack ? 2 : 0)
+      if (aScore !== bScore) return bScore - aScore
+      if (!alarmTs) return bTs - aTs
+      return Math.abs(aTs - alarmTs) - Math.abs(bTs - alarmTs)
+    })
+    return sorted[0]?.event_id || ''
+  } catch (error) {
+    console.warn('匹配报警事件失败:', error)
+    return ''
+  }
+}
+
+const goToAlarmReplay = async () => {
+  const alarm = flashConfirmAlarm.value
+  let eventId = buildAlarmEventId(alarm)
+  const eventType = buildAlarmEventType(alarm?.alarm_type)
+  const queryEventType = eventType === 'unknown' ? 'all' : eventType
+  if (!eventId) {
+    eventId = await findFallbackEventId(alarm)
+  }
+  const query = {
+    view: 'timeline',
+    event_type: queryEventType
+  }
+  if (eventId) {
+    query.eventId = eventId
+  } else {
+    ElMessage.warning('未匹配到对应回放，已跳转到报警事件列表')
+  }
+  router.push({ path: '/alarm-events', query })
 }
 
 const speakAlarm = (text) => {
@@ -463,13 +550,15 @@ const processAlarmQueue = async () => {
 
   try {
     if (soundLightEnabled) {
-      triggerFlashRed(alarmText, !popupEnabled)
+      triggerFlashRed(alarmText, !popupEnabled, alarm)
       speakAlarm(alarmText)
     }
 
     if (popupEnabled) {
-      await ElMessageBox.alert(alarmText, '报警提示', {
-        confirmButtonText: '确认关闭报警',
+      await ElMessageBox.confirm(alarmText, '报警提示', {
+        confirmButtonText: '关闭报警',
+        cancelButtonText: '查看回放',
+        distinguishCancelAndClose: true,
         type: 'warning',
         closeOnClickModal: false,
         closeOnPressEscape: false,
@@ -483,7 +572,14 @@ const processAlarmQueue = async () => {
       await waitFlashConfirm()
     }
   } catch (error) {
-    console.warn('报警确认中断:', error)
+    if (error === 'cancel') {
+      await goToAlarmReplay()
+      if (soundLightEnabled) {
+        closeFlashRed()
+      }
+    } else {
+      console.warn('报警确认中断:', error)
+    }
   } finally {
     if (typeof window !== 'undefined' && window.speechSynthesis) {
       window.speechSynthesis.cancel()
@@ -817,6 +913,12 @@ const handleLogout = async () => {
   font-size: 16px;
   line-height: 1.6;
   margin-bottom: 16px;
+}
+
+.flash-confirm-actions {
+  display: flex;
+  justify-content: center;
+  gap: 10px;
 }
 
 @keyframes alarm-red-blink {
