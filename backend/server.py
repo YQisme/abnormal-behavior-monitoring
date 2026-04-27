@@ -2791,11 +2791,11 @@ def get_local_cameras():
 @app.route('/api/drowsy/video', methods=['POST'])
 def set_video():
     """设置视频URL、摄像头IP和检测间隔"""
-    global video_path, camera_ip, camera_check_interval
+    global video_path, camera_ip, camera_check_interval, camera_status, camera_last_status
     profile = get_profile_from_request_path(request.path)
     ensure_detection_profile(profile)
     
-    data = request.json
+    data = request.get_json(silent=True) or {}
     new_video_url = data.get('video_url')
     new_camera_ip = data.get('camera_ip', '')
     new_check_interval = data.get('camera_check_interval')
