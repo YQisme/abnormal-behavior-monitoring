@@ -9,8 +9,11 @@ import time
 import json
 import os
 import glob
+import csv
+import io
 import base64
 import math
+import shutil
 import numpy as np
 from datetime import datetime
 from ultralytics import YOLO
@@ -4177,76 +4180,277 @@ def set_alarm_config():
         return jsonify({"success": False, "message": f"设置失败: {str(e)}"}), 500
 
 
+def _collect_alarm_events_data(limit=200, media_type='all', event_type_filter='all', start_time=None, end_time=None):
+    """收集报警事件数据，供列表与导出复用"""
+    event_root = alarm_config.get('event_save_path', os.path.join(BASE_DIR, "alarm_events"))
+    event_root = os.path.abspath(event_root)
+    os.makedirs(event_root, exist_ok=True)
+
+    if media_type not in ('all', 'image', 'video'):
+        raise ValueError("type 参数必须是 all/image/video")
+    if event_type_filter not in ('all', 'zone', 'offpost', 'drowsy', 'unknown'):
+        raise ValueError("event_type 参数必须是 all/zone/offpost/drowsy/unknown")
+    if start_time is not None and end_time is not None and start_time > end_time:
+        raise ValueError("开始时间不能晚于结束时间")
+
+    image_exts = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
+    video_exts = {'.mp4', '.avi', '.mov', '.mkv', '.webm'}
+    items = []
+    grouped_map = {}
+
+    def infer_event_doc(event_type, media):
+        relative_path = media.get("relative_path", "")
+        filename = media.get("name", "")
+        stem = os.path.splitext(filename)[0]
+        parts = stem.split('_')
+        doc = {
+            "title": f"报警事件 - {event_type}",
+            "event_type": event_type,
+            "event_id": f"{event_type}:{stem}",
+            "occurred_at": media.get("modified_at"),
+            "object_name": "未知目标",
+            "zone_name": "未知区域",
+            "track_id": None,
+            "source_file": relative_path,
+            "description": f"{event_type} 类型报警事件，来源文件：{filename}"
+        }
+        # 期望文件名示例:
+        # alarm_20260427_154938_ID-1_人员离岗_当前区域.mp4
+        if len(parts) >= 6 and parts[0] == 'alarm':
+            date_part = parts[1]
+            time_part = parts[2]
+            track_token = parts[3]
+            zone_name = parts[-1]
+            object_name = '_'.join(parts[4:-1]) if len(parts) > 5 else "未知目标"
+            if track_token.startswith('ID'):
+                doc["track_id"] = track_token[2:]
+            doc["object_name"] = object_name or "未知目标"
+            doc["zone_name"] = zone_name or "未知区域"
+            doc["description"] = f"{event_type} 报警：目标 {doc['object_name']} 进入/触发区域 {doc['zone_name']}"
+            if len(date_part) == 8 and len(time_part) == 6:
+                try:
+                    dt = datetime.strptime(f"{date_part}{time_part}", "%Y%m%d%H%M%S")
+                    doc["occurred_at"] = dt.timestamp()
+                except Exception:
+                    pass
+        return doc
+
+    for root, _, files in os.walk(event_root):
+        for filename in files:
+            # 转码过程产生的临时/缓存文件不在页面展示，避免重复
+            if filename.endswith('_web.mp4'):
+                continue
+            ext = os.path.splitext(filename)[1].lower()
+            item_type = None
+            if ext in image_exts:
+                item_type = 'image'
+            elif ext in video_exts:
+                item_type = 'video'
+
+            if item_type is None:
+                continue
+            if media_type != 'all' and media_type != item_type:
+                continue
+
+            full_path = os.path.join(root, filename)
+            rel_path = os.path.relpath(full_path, event_root).replace(os.sep, '/')
+            rel_parts = rel_path.split('/')
+            event_type = rel_parts[0] if len(rel_parts) > 2 else 'unknown'
+            if event_type_filter != 'all' and event_type_filter != event_type:
+                continue
+
+            try:
+                stat = os.stat(full_path)
+            except OSError:
+                continue
+            modified_ts = stat.st_mtime
+            if start_time is not None and modified_ts < start_time:
+                continue
+            if end_time is not None and modified_ts > end_time:
+                continue
+
+            media_item = {
+                "name": filename,
+                "relative_path": rel_path,
+                "media_type": item_type,
+                "event_type": event_type,
+                "size": stat.st_size,
+                "modified_at": modified_ts,
+                "media_url": f"/api/alarm-events/media/{quote(rel_path, safe='/')}"
+            }
+            items.append(media_item)
+
+            stem = os.path.splitext(filename)[0]
+            group_key = f"{event_type}:{stem}"
+            if group_key not in grouped_map:
+                grouped_map[group_key] = {
+                    "event_id": group_key,
+                    "event_type": event_type,
+                    "occurred_at": modified_ts,
+                    "total_size": 0,
+                    "image": None,
+                    "video": None,
+                    "document": None
+                }
+            grouped = grouped_map[group_key]
+            grouped["total_size"] += stat.st_size
+            grouped["occurred_at"] = max(grouped["occurred_at"], modified_ts)
+            if item_type == 'image':
+                grouped["image"] = media_item
+            elif item_type == 'video':
+                grouped["video"] = media_item
+            if grouped["document"] is None:
+                grouped["document"] = infer_event_doc(event_type, media_item)
+
+    items.sort(key=lambda x: x.get("modified_at", 0), reverse=True)
+    timeline_events = sorted(grouped_map.values(), key=lambda x: x.get("occurred_at", 0), reverse=True)
+
+    by_event_type = {
+        "zone": [],
+        "offpost": [],
+        "drowsy": [],
+        "unknown": []
+    }
+    for event in timeline_events:
+        by_event_type.setdefault(event["event_type"], [])
+        by_event_type[event["event_type"]].append(event)
+
+    disk = shutil.disk_usage(event_root)
+    return {
+        "success": True,
+        "total": len(items),
+        "items": items[:limit],
+        "timeline_events": timeline_events[:limit],
+        "grouped_timeline": by_event_type,
+        "storage": {
+            "event_root": event_root,
+            "events_used_bytes": sum(item.get("size", 0) for item in items),
+            "disk_total_bytes": disk.total,
+            "disk_used_bytes": disk.used,
+            "disk_free_bytes": disk.free
+        },
+        "event_root": event_root
+    }
+
+
 @app.route('/api/alarm-events', methods=['GET'])
 def list_alarm_events():
     """列出报警事件图片/视频文件"""
     try:
-        event_root = alarm_config.get('event_save_path', os.path.join(BASE_DIR, "alarm_events"))
-        event_root = os.path.abspath(event_root)
-        os.makedirs(event_root, exist_ok=True)
-
         media_type = (request.args.get('type') or 'all').strip().lower()
-        if media_type not in ('all', 'image', 'video'):
-            return jsonify({"success": False, "message": "type 参数必须是 all/image/video"}), 400
+        event_type_filter = (request.args.get('event_type') or 'all').strip().lower()
+        start_time = request.args.get('start_time')
+        end_time = request.args.get('end_time')
 
         try:
             limit = int(request.args.get('limit', 200))
         except (TypeError, ValueError):
             limit = 200
         limit = max(1, min(limit, 1000))
-
-        image_exts = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
-        video_exts = {'.mp4', '.avi', '.mov', '.mkv', '.webm'}
-        items = []
-
-        for root, _, files in os.walk(event_root):
-            for filename in files:
-                # 转码过程产生的临时/缓存文件不在页面展示，避免重复
-                if filename.endswith('_web.mp4'):
-                    continue
-                ext = os.path.splitext(filename)[1].lower()
-                item_type = None
-                if ext in image_exts:
-                    item_type = 'image'
-                elif ext in video_exts:
-                    item_type = 'video'
-
-                if item_type is None:
-                    continue
-                if media_type != 'all' and media_type != item_type:
-                    continue
-
-                full_path = os.path.join(root, filename)
-                rel_path = os.path.relpath(full_path, event_root).replace(os.sep, '/')
-
-                try:
-                    stat = os.stat(full_path)
-                except OSError:
-                    continue
-
-                rel_parts = rel_path.split('/')
-                event_type = rel_parts[0] if len(rel_parts) > 2 else 'unknown'
-                items.append({
-                    "name": filename,
-                    "relative_path": rel_path,
-                    "media_type": item_type,
-                    "event_type": event_type,
-                    "size": stat.st_size,
-                    "modified_at": stat.st_mtime,
-                    "media_url": f"/api/alarm-events/media/{quote(rel_path, safe='/')}"
-                })
-
-        items.sort(key=lambda x: x.get("modified_at", 0), reverse=True)
-
-        return jsonify({
-            "success": True,
-            "total": len(items),
-            "items": items[:limit],
-            "event_root": event_root
-        })
+        start_ts = float(start_time) if start_time not in (None, '') else None
+        end_ts = float(end_time) if end_time not in (None, '') else None
+        data = _collect_alarm_events_data(
+            limit=limit,
+            media_type=media_type,
+            event_type_filter=event_type_filter,
+            start_time=start_ts,
+            end_time=end_ts
+        )
+        return jsonify(data)
+    except ValueError as e:
+        return jsonify({"success": False, "message": str(e)}), 400
     except Exception as e:
         backend_logger.error(f"获取报警事件列表失败: {e}")
         return jsonify({"success": False, "message": f"获取失败: {str(e)}"}), 500
+
+
+@app.route('/api/alarm-events/export', methods=['GET'])
+def export_alarm_events_docs():
+    """导出报警事件文档（JSON/CSV）"""
+    try:
+        export_format = (request.args.get('format') or 'json').strip().lower()
+        event_type_filter = (request.args.get('event_type') or 'all').strip().lower()
+        start_time = request.args.get('start_time')
+        end_time = request.args.get('end_time')
+        if export_format not in ('json', 'csv'):
+            return jsonify({"success": False, "message": "format 参数必须是 json 或 csv"}), 400
+
+        start_ts = float(start_time) if start_time not in (None, '') else None
+        end_ts = float(end_time) if end_time not in (None, '') else None
+        data = _collect_alarm_events_data(
+            limit=100000,
+            media_type='all',
+            event_type_filter=event_type_filter,
+            start_time=start_ts,
+            end_time=end_ts
+        )
+        docs = []
+        for event in data.get('timeline_events', []):
+            document = event.get('document') or {}
+            docs.append({
+                "event_id": document.get("event_id") or event.get("event_id"),
+                "event_type": document.get("event_type") or event.get("event_type"),
+                "occurred_at": document.get("occurred_at") or event.get("occurred_at"),
+                "occurred_time": datetime.fromtimestamp(document.get("occurred_at") or event.get("occurred_at") or 0).strftime("%Y-%m-%d %H:%M:%S") if (document.get("occurred_at") or event.get("occurred_at")) else "",
+                "object_name": document.get("object_name") or "",
+                "zone_name": document.get("zone_name") or "",
+                "track_id": document.get("track_id") or "",
+                "description": document.get("description") or "",
+                "event_total_size": event.get("total_size", 0),
+                "image_file": (event.get("image") or {}).get("relative_path", ""),
+                "video_file": (event.get("video") or {}).get("relative_path", "")
+            })
+
+        now_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+        suffix = f"_{event_type_filter}" if event_type_filter != 'all' else ""
+
+        if export_format == 'json':
+            payload = json.dumps({
+                "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "event_type_filter": event_type_filter,
+                "count": len(docs),
+                "documents": docs
+            }, ensure_ascii=False, indent=2)
+            filename = f"alarm_events_documents{suffix}_{now_tag}.json"
+            return Response(
+                payload,
+                mimetype='application/json; charset=utf-8',
+                headers={'Content-Disposition': f'attachment; filename="{filename}"'}
+            )
+
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow([
+            'event_id', 'event_type', 'occurred_time', 'object_name', 'zone_name',
+            'track_id', 'description', 'event_total_size', 'image_file', 'video_file'
+        ])
+        for doc in docs:
+            writer.writerow([
+                doc.get('event_id', ''),
+                doc.get('event_type', ''),
+                doc.get('occurred_time', ''),
+                doc.get('object_name', ''),
+                doc.get('zone_name', ''),
+                doc.get('track_id', ''),
+                doc.get('description', ''),
+                doc.get('event_total_size', 0),
+                doc.get('image_file', ''),
+                doc.get('video_file', '')
+            ])
+        csv_text = output.getvalue()
+        output.close()
+
+        filename = f"alarm_events_documents{suffix}_{now_tag}.csv"
+        return Response(
+            csv_text,
+            mimetype='text/csv; charset=utf-8',
+            headers={'Content-Disposition': f'attachment; filename="{filename}"'}
+        )
+    except ValueError as e:
+        return jsonify({"success": False, "message": str(e)}), 400
+    except Exception as e:
+        backend_logger.error(f"导出报警事件文档失败: {e}")
+        return jsonify({"success": False, "message": f"导出失败: {str(e)}"}), 500
 
 
 @app.route('/api/alarm-events/media/<path:relative_path>', methods=['GET'])
@@ -4328,6 +4532,83 @@ def get_alarm_event_media(relative_path):
     except Exception as e:
         backend_logger.error(f"读取报警事件媒体失败: {e}")
         return jsonify({"success": False, "message": f"读取失败: {str(e)}"}), 500
+
+
+@app.route('/api/alarm-events', methods=['DELETE'])
+def delete_alarm_event():
+    """删除报警事件媒体（支持单文件或整组事件）"""
+    try:
+        data = request.json or {}
+        relative_path = (data.get('relative_path') or '').strip().replace('\\', '/').lstrip('/')
+        relative_paths = data.get('relative_paths') or []
+        event_id = (data.get('event_id') or '').strip()
+        delete_scope = (data.get('delete_scope') or 'single').strip().lower()  # single/event
+
+        if delete_scope not in ('single', 'event'):
+            return jsonify({"success": False, "message": "delete_scope 必须是 single 或 event"}), 400
+        if not isinstance(relative_paths, list):
+            return jsonify({"success": False, "message": "relative_paths 必须是数组"}), 400
+        normalized_batch_paths = [
+            str(path).strip().replace('\\', '/').lstrip('/')
+            for path in relative_paths
+            if str(path).strip()
+        ]
+        if not relative_path and not event_id and not normalized_batch_paths:
+            return jsonify({"success": False, "message": "缺少 relative_path / relative_paths / event_id"}), 400
+
+        event_root = alarm_config.get('event_save_path', os.path.join(BASE_DIR, "alarm_events"))
+        event_root = os.path.abspath(event_root)
+        os.makedirs(event_root, exist_ok=True)
+
+        deleted_files = []
+
+        def remove_file_safe(abs_target):
+            if not os.path.isfile(abs_target):
+                return
+            try:
+                os.remove(abs_target)
+                deleted_files.append(os.path.relpath(abs_target, event_root).replace(os.sep, '/'))
+            except Exception as remove_error:
+                backend_logger.error(f"删除报警事件文件失败: {abs_target}, {remove_error}")
+
+        if normalized_batch_paths:
+            for batch_path in normalized_batch_paths:
+                abs_target = os.path.abspath(os.path.join(event_root, batch_path))
+                if not abs_target.startswith(event_root + os.sep):
+                    continue
+                remove_file_safe(abs_target)
+        elif relative_path:
+            abs_target = os.path.abspath(os.path.join(event_root, relative_path))
+            if not abs_target.startswith(event_root + os.sep):
+                return jsonify({"success": False, "message": "非法路径"}), 400
+            if delete_scope == 'single':
+                remove_file_safe(abs_target)
+            else:
+                dirname = os.path.dirname(abs_target)
+                stem = os.path.splitext(os.path.basename(abs_target))[0]
+                for ext in ('.jpg', '.jpeg', '.png', '.bmp', '.webp', '.mp4', '.avi', '.mov', '.mkv', '.webm'):
+                    remove_file_safe(os.path.join(dirname, f"{stem}{ext}"))
+        else:
+            # event_id 格式：event_type:stem
+            event_parts = event_id.split(':', 1)
+            if len(event_parts) != 2:
+                return jsonify({"success": False, "message": "event_id 格式错误"}), 400
+            event_type, stem = event_parts
+            for media_dir in ('images', 'videos'):
+                base_dir = os.path.join(event_root, event_type, media_dir)
+                if not os.path.isdir(base_dir):
+                    continue
+                for ext in ('.jpg', '.jpeg', '.png', '.bmp', '.webp', '.mp4', '.avi', '.mov', '.mkv', '.webm'):
+                    remove_file_safe(os.path.join(base_dir, f"{stem}{ext}"))
+
+        return jsonify({
+            "success": True,
+            "deleted_count": len(deleted_files),
+            "deleted_files": deleted_files
+        })
+    except Exception as e:
+        backend_logger.error(f"删除报警事件失败: {e}")
+        return jsonify({"success": False, "message": f"删除失败: {str(e)}"}), 500
 
 if __name__ == '__main__':
     backend_logger.info("="*60)
