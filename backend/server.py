@@ -2545,14 +2545,18 @@ def generate_raw_video_stream():
 # MJPEG视频流生成器（经过YOLO处理）
 def generate_processed_video_stream():
     """生成经过YOLO处理的视频流的MJPEG流"""
-    global latest_annotated_frame
+    global latest_annotated_frame, latest_frame
     
     while not stop_flag.is_set():
         try:
-            # 获取最新处理后的帧
+            # 优先发送处理帧；切换瞬间若无处理帧则回退原始帧，避免黑屏
+            frame = None
             if latest_annotated_frame is not None:
                 frame = latest_annotated_frame.copy()
-                
+            elif latest_frame is not None:
+                frame = latest_frame.copy()
+
+            if frame is not None:
                 # 编码为JPEG
                 success, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
                 if success:
@@ -3928,12 +3932,24 @@ def video_stream():
 @app.route('/api/drowsy/video/processed_stream')
 def processed_video_stream():
     """经过YOLO处理的视频流（MJPEG格式，包含检测框和区域）"""
-    profile = get_profile_from_request_path(request.path)
-    ensure_detection_profile(profile, force=True)
     return Response(
         generate_processed_video_stream(),
         mimetype='multipart/x-mixed-replace; boundary=frame'
     )
+
+
+@app.route('/api/activate_profile', methods=['POST'])
+@app.route('/api/offpost/activate_profile', methods=['POST'])
+@app.route('/api/drowsy/activate_profile', methods=['POST'])
+def activate_profile_api():
+    """按请求路径激活检测档案（页面切换时调用）"""
+    profile = get_profile_from_request_path(request.path)
+    changed = ensure_detection_profile(profile, force=True)
+    return jsonify({
+        "success": True,
+        "profile": profile,
+        "changed": bool(changed)
+    })
 
 
 # 录制相关API

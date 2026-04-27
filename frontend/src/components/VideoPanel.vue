@@ -11,7 +11,7 @@
     </template>
     
     <div class="video-container" ref="containerRef">
-      <img ref="videoImgRef" class="video-img" :src="processedVideoStreamUrl" @load="onVideoImageLoad" @error="onVideoImageError" />
+      <img ref="videoImgRef" class="video-img" :src="displayVideoSrc" @load="onVideoImageLoad" @error="onVideoImageError" />
       <canvas ref="drawCanvasRef" class="draw-canvas" @click="handleCanvasClick" @mousemove="handleCanvasMouseMove" @dblclick="finishDrawing"></canvas>
       
     </div>
@@ -52,6 +52,9 @@ const emit = defineEmits(['zones-updated'])
 const containerRef = ref(null)
 const videoImgRef = ref(null)
 const drawCanvasRef = ref(null)
+const streamNonce = ref(Date.now())
+const socketFrameSrc = ref('')
+let streamReconnectTimer = null
 
 let drawCtx = null
 
@@ -60,8 +63,9 @@ const processedVideoStreamUrl = computed(() => {
   const baseUrl = import.meta.env.DEV 
     ? (import.meta.env.VITE_API_URL || `http://${window.location.hostname}:5000`)
     : window.location.origin
-  return `${baseUrl}${props.apiPrefix}/video/processed_stream`
+  return `${baseUrl}${props.apiPrefix}/video/processed_stream?ts=${streamNonce.value}`
 })
+const displayVideoSrc = computed(() => socketFrameSrc.value || processedVideoStreamUrl.value)
 
 const isDrawing = ref(false)
 const polygonPoints = ref([])
@@ -102,6 +106,10 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  if (streamReconnectTimer) {
+    clearTimeout(streamReconnectTimer)
+    streamReconnectTimer = null
+  }
   window.removeEventListener('resize', resizeCanvases)
   window.removeEventListener('keydown', handleKeyPress)
 })
@@ -113,6 +121,10 @@ watch(() => props.zones, (newZones) => {
 }, { deep: true })
 
 watch(() => props.apiPrefix, () => {
+  streamNonce.value = Date.now()
+  socketFrameSrc.value = ''
+  videoWidth = 0
+  videoHeight = 0
   loadZones()
 })
 
@@ -136,6 +148,10 @@ const resizeCanvases = () => {
 }
 
 const onVideoImageLoad = () => {
+  if (streamReconnectTimer) {
+    clearTimeout(streamReconnectTimer)
+    streamReconnectTimer = null
+  }
   if (videoImgRef.value) {
     const img = videoImgRef.value
     if (videoWidth !== img.naturalWidth || videoHeight !== img.naturalHeight) {
@@ -151,11 +167,21 @@ const onVideoImageLoad = () => {
 const onVideoImageError = (error) => {
   console.error('视频流加载错误:', error)
   resolution.value = '连接失败'
+  if (streamReconnectTimer) {
+    return
+  }
+  streamReconnectTimer = setTimeout(() => {
+    streamNonce.value = Date.now()
+    streamReconnectTimer = null
+  }, 800)
 }
 
 // 保留updateFrame方法以兼容WebSocket（如果需要检测数据）
 const updateFrame = (data) => {
   // 如果使用MJPEG流，这个方法不再需要，但保留以兼容
+  if (data && typeof data.frame === 'string' && data.frame.startsWith('data:image/')) {
+    socketFrameSrc.value = data.frame
+  }
   if (data && data.fps !== undefined) {
     fps.value = data.fps
   }

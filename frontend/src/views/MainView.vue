@@ -34,6 +34,7 @@
         <el-row :gutter="20" class="video-row">
           <el-col :span="16">
             <VideoPanel
+              :key="`video-panel-${alarmApiPrefix}`"
               ref="videoPanelRef"
               :zones="zones"
               :api-prefix="alarmApiPrefix"
@@ -153,12 +154,17 @@ import ZoneManager from '../components/ZoneManager.vue'
 
 const router = useRouter()
 const route = useRoute()
+const resolveAlarmApiPrefixByPath = (path) => {
+  if (path === '/leave-monitor') return '/api/offpost'
+  if (path === '/drowsy-monitor') return '/api/drowsy'
+  return '/api'
+}
 const isLeaveMonitorMode = ref(false)
 const isDrowsyMonitorMode = ref(false)
 const pageTitle = ref('人员检测与区域报警系统')
 const videoPanelTitle = ref('区域报警')
 const zoneTabLabel = ref('区域管理')
-const alarmApiPrefix = ref('/api')
+const alarmApiPrefix = ref(resolveAlarmApiPrefixByPath(route.path))
 
 // 状态
 const connectionStatus = ref('disconnected')
@@ -228,24 +234,33 @@ const refreshPageMode = () => {
     pageTitle.value = '人员检测与离岗监测系统'
     videoPanelTitle.value = '离岗监测'
     zoneTabLabel.value = '离岗区域管理'
-    alarmApiPrefix.value = '/api/offpost'
+    alarmApiPrefix.value = resolveAlarmApiPrefixByPath(route.path)
     return
   }
   if (isDrowsyMonitorMode.value) {
     pageTitle.value = '人员检测与瞌睡监测系统'
     videoPanelTitle.value = '瞌睡监测'
     zoneTabLabel.value = '瞌睡区域管理'
-    alarmApiPrefix.value = '/api/drowsy'
+    alarmApiPrefix.value = resolveAlarmApiPrefixByPath(route.path)
     return
   }
   pageTitle.value = '人员检测与区域报警系统'
   videoPanelTitle.value = '区域报警'
   zoneTabLabel.value = '区域管理'
-  alarmApiPrefix.value = '/api'
+  alarmApiPrefix.value = resolveAlarmApiPrefixByPath(route.path)
+}
+
+const activateCurrentProfile = async () => {
+  try {
+    await axios.post(`${alarmApiPrefix.value}/activate_profile`)
+  } catch (error) {
+    console.error('激活监测模式失败:', error)
+  }
 }
 
 onMounted(() => {
   refreshPageMode()
+  activateCurrentProfile()
   // 检查登录状态
   checkLoginStatus()
 
@@ -363,6 +378,7 @@ onUnmounted(() => {
 
 watch(() => route.path, () => {
   refreshPageMode()
+  activateCurrentProfile()
   handleZonesUpdated()
 })
 
