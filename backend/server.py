@@ -13,6 +13,7 @@ import csv
 import io
 import base64
 import math
+import gc
 import shutil
 import numpy as np
 from datetime import datetime
@@ -186,6 +187,8 @@ occlusion_config_file = os.path.join(CONFIG_DIR, "occlusion_config.json")  # 遮
 latest_frame = None  # 最新帧
 latest_results = None  # 最新检测结果
 latest_annotated_frame = None  # 最新处理后的帧（包含YOLO检测结果和区域绘制）
+DETECTION_GC_INTERVAL_FRAMES = 120  # 每处理固定帧数执行一次轻量内存回收
+detection_processed_frames = 0
 
 # 检测配置档案（用于“区域报警/离岗监测”两套独立配置）
 DETECTION_PROFILE_ZONE = "zone_alarm"
@@ -1938,7 +1941,7 @@ def video_reader():
 
 def detection_worker():
     """检测工作线程"""
-    global latest_frame, latest_results, latest_annotated_frame, zones, fps_counter, display_config, zone_has_people_mqtt_sent, inference_running, offpost_last_seen_person_ts, offpost_absence_alarm_sent, inference_running_profiles, drowsy_last_state
+    global latest_frame, latest_results, latest_annotated_frame, zones, fps_counter, display_config, zone_has_people_mqtt_sent, inference_running, offpost_last_seen_person_ts, offpost_absence_alarm_sent, inference_running_profiles, drowsy_last_state, detection_processed_frames
     
     while not stop_flag.is_set():
         try:
@@ -1979,15 +1982,32 @@ def detection_worker():
                 time.sleep(0.05)
                 continue
             
-            # YOLO跟踪检测（使用锁保护模型访问）
+            # 仅在“区域报警”档案下保留跨帧跟踪；其它档案用普通检测，避免长期累计跟踪状态
             try:
                 with model_lock:
                     if model is None:
                         time.sleep(0.1)
                         continue
-                    # 在使用时指定设备与推理尺寸，stream=True返回生成器，需要获取第一个结果
-                    results_generator = model.track(frame, persist=True, stream=True, device=device, classes=[0], imgsz=yolo_imgsz)
-                    results = next(results_generator)  # 从生成器中获取结果
+                    if current_detection_profile == DETECTION_PROFILE_ZONE:
+                        infer_outputs = model.track(
+                            frame,
+                            persist=True,
+                            stream=False,
+                            device=device,
+                            classes=[0],
+                            imgsz=yolo_imgsz,
+                            verbose=False
+                        )
+                    else:
+                        infer_outputs = model.predict(
+                            frame,
+                            stream=False,
+                            device=device,
+                            classes=[0],
+                            imgsz=yolo_imgsz,
+                            verbose=False
+                        )
+                    results = infer_outputs[0] if isinstance(infer_outputs, (list, tuple)) else infer_outputs
                 latest_results = results
             except Exception as e:
                 yolo_logger.error(f"YOLO检测错误: {e}")
@@ -2003,52 +2023,51 @@ def detection_worker():
                 if results.boxes is not None and len(results.boxes) > 0:
                     boxes = results.boxes
                     track_ids = results.boxes.id
-                    
-                    if track_ids is not None:
-                        for i, box in enumerate(boxes):
-                            if not _box_has_valid_data(box):
-                                continue
-                            cls_id = int(box.cls[0])
-                            
-                            # 只检测启用的类别
-                            if is_class_enabled(cls_id):
-                                conf = float(box.conf[0])
-                                # 检查置信度是否满足阈值要求
-                                if check_confidence(cls_id, conf):
-                                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                                    bbox_center = [(x1 + x2) / 2, (y1 + y2) / 2]
-                                    
-                                    # 检测是否进入区域：无区域时默认全画面为区域
-                                    in_zone = False
-                                    zone_id = 'full_frame'
-                                    zone_name = '当前区域'
-                                    if no_zone_mode:
-                                        in_zone = True
-                                    else:
-                                        detection_mode = alarm_config.get('detection_mode', 'center')
-                                        for zone in enabled_zones:
-                                            zone_points = zone.get('points', [])
-                                            if len(zone_points) < 3:
-                                                continue
-                                            if detection_mode == 'center':
-                                                # 中心点模式：检查中心点是否在多边形内
-                                                in_zone = is_point_in_polygon(bbox_center, zone_points)
-                                            elif detection_mode == 'edge':
-                                                # 边框任意点模式：检查检测框是否与多边形有交集
-                                                in_zone = is_bbox_in_polygon([x1, y1, x2, y2], zone_points)
-                                            if in_zone:
-                                                zone_id = zone.get('id', 'unknown')
-                                                zone_name = zone.get('name', '未知区域')
-                                                break
-                                    
-                                    if in_zone:
-                                        person_in_zone_this_frame = True
-                                        if current_detection_profile not in (DETECTION_PROFILE_OFFPOST, DETECTION_PROFILE_DROWSY):
-                                            track_id = int(track_ids[i])
-                                            class_name_cn = get_class_name_cn(cls_id)
-                                            trigger_alarm(track_id, bbox_center, zone_id, zone_name, cls_id, class_name_cn)
-                                        if not no_zone_mode:
-                                            break  # 区域模式下只对第一个匹配的区域报警
+
+                    for i, box in enumerate(boxes):
+                        if not _box_has_valid_data(box):
+                            continue
+                        cls_id = int(box.cls[0])
+                        
+                        # 只检测启用的类别
+                        if is_class_enabled(cls_id):
+                            conf = float(box.conf[0])
+                            # 检查置信度是否满足阈值要求
+                            if check_confidence(cls_id, conf):
+                                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                                bbox_center = [(x1 + x2) / 2, (y1 + y2) / 2]
+                                
+                                # 检测是否进入区域：无区域时默认全画面为区域
+                                in_zone = False
+                                zone_id = 'full_frame'
+                                zone_name = '当前区域'
+                                if no_zone_mode:
+                                    in_zone = True
+                                else:
+                                    detection_mode = alarm_config.get('detection_mode', 'center')
+                                    for zone in enabled_zones:
+                                        zone_points = zone.get('points', [])
+                                        if len(zone_points) < 3:
+                                            continue
+                                        if detection_mode == 'center':
+                                            # 中心点模式：检查中心点是否在多边形内
+                                            in_zone = is_point_in_polygon(bbox_center, zone_points)
+                                        elif detection_mode == 'edge':
+                                            # 边框任意点模式：检查检测框是否与多边形有交集
+                                            in_zone = is_bbox_in_polygon([x1, y1, x2, y2], zone_points)
+                                        if in_zone:
+                                            zone_id = zone.get('id', 'unknown')
+                                            zone_name = zone.get('name', '未知区域')
+                                            break
+                                
+                                if in_zone:
+                                    person_in_zone_this_frame = True
+                                    if current_detection_profile not in (DETECTION_PROFILE_OFFPOST, DETECTION_PROFILE_DROWSY):
+                                        track_id = int(track_ids[i]) if track_ids is not None and i < len(track_ids) else -1
+                                        class_name_cn = get_class_name_cn(cls_id)
+                                        trigger_alarm(track_id, bbox_center, zone_id, zone_name, cls_id, class_name_cn)
+                                    if not no_zone_mode:
+                                        break  # 区域模式下只对第一个匹配的区域报警
                 if current_detection_profile == DETECTION_PROFILE_OFFPOST:
                     current_ts = time.time()
                     if person_in_zone_this_frame:
@@ -2088,112 +2107,111 @@ def detection_worker():
                 boxes = results.boxes
                 track_ids = results.boxes.id
                 
-                if track_ids is not None:
-                    for i, box in enumerate(boxes):
-                        if not _box_has_valid_data(box):
-                            continue
-                        cls_id = int(box.cls[0])
-                        
-                        # 只绘制启用的类别
-                        if is_class_enabled(cls_id):
-                            conf = float(box.conf[0])
-                            # 检查置信度是否满足阈值要求
-                            if check_confidence(cls_id, conf):
-                                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                                track_id = int(track_ids[i])
-                                bbox_center = [(x1 + x2) / 2, (y1 + y2) / 2]
-                                
-                                # 判断是否在任何一个启用的报警区域内
-                                in_zone = False
-                                enabled_zones = [z for z in zones if z.get('enabled', True) and len(z.get('points', [])) >= 3]
-                                if not enabled_zones:
-                                    in_zone = True  # 无区域时全画面视为在区
-                                elif enabled_zones:
-                                    detection_mode = alarm_config.get('detection_mode', 'center')
-                                    for zone in enabled_zones:
-                                        zone_points = zone.get('points', [])
-                                        if len(zone_points) < 3:
-                                            continue
+                for i, box in enumerate(boxes):
+                    if not _box_has_valid_data(box):
+                        continue
+                    cls_id = int(box.cls[0])
+                    
+                    # 只绘制启用的类别
+                    if is_class_enabled(cls_id):
+                        conf = float(box.conf[0])
+                        # 检查置信度是否满足阈值要求
+                        if check_confidence(cls_id, conf):
+                            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                            track_id = int(track_ids[i]) if track_ids is not None and i < len(track_ids) else -1
+                            bbox_center = [(x1 + x2) / 2, (y1 + y2) / 2]
+                            
+                            # 判断是否在任何一个启用的报警区域内
+                            in_zone = False
+                            enabled_zones = [z for z in zones if z.get('enabled', True) and len(z.get('points', [])) >= 3]
+                            if not enabled_zones:
+                                in_zone = True  # 无区域时全画面视为在区
+                            elif enabled_zones:
+                                detection_mode = alarm_config.get('detection_mode', 'center')
+                                for zone in enabled_zones:
+                                    zone_points = zone.get('points', [])
+                                    if len(zone_points) < 3:
+                                        continue
                                     if detection_mode == 'center':
                                         # 中心点模式：检查中心点是否在多边形内
-                                            if is_point_in_polygon(bbox_center, zone_points):
-                                                in_zone = True
-                                                break
+                                        if is_point_in_polygon(bbox_center, zone_points):
+                                            in_zone = True
+                                            break
                                     elif detection_mode == 'edge':
                                         # 边框任意点模式：检查检测框是否与多边形有交集
-                                            if is_bbox_in_polygon([x1, y1, x2, y2], zone_points):
-                                                in_zone = True
-                                                break
+                                        if is_bbox_in_polygon([x1, y1, x2, y2], zone_points):
+                                            in_zone = True
+                                            break
+                            
+                            # 绘制检测框（在区域内用红色，否则用配置的颜色）
+                            x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                            if in_zone:
+                                # 在报警区域内：使用红色 (BGR格式: 0, 0, 255)
+                                box_color = (0, 0, 255)
+                                # 文字颜色也使用红色 (RGB格式: 255, 0, 0)
+                                text_color_rgb = (255, 0, 0)
+                            else:
+                                # 不在区域内：使用配置的默认颜色
+                                box_color = tuple(display_config['box_color'])
+                                # 文字颜色使用配置的颜色
+                                text_color_rgb = tuple(display_config['text_color'])
+                            box_thickness = display_config['box_thickness']
+                            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), box_color, box_thickness)
+                            
+                            # 获取类别名称并绘制文字
+                            if display_config.get('use_chinese', True):
+                                # 使用中文显示
+                                class_name = get_class_name_cn(cls_id)
+                                label = f"{class_name} {conf:.2f} ID:{track_id}"
                                 
-                                # 绘制检测框（在区域内用红色，否则用配置的颜色）
-                                x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-                                if in_zone:
-                                    # 在报警区域内：使用红色 (BGR格式: 0, 0, 255)
-                                    box_color = (0, 0, 255)
-                                    # 文字颜色也使用红色 (RGB格式: 255, 0, 0)
-                                    text_color_rgb = (255, 0, 0)
-                                else:
-                                    # 不在区域内：使用配置的默认颜色
-                                    box_color = tuple(display_config['box_color'])
-                                    # 文字颜色使用配置的颜色
-                                    text_color_rgb = tuple(display_config['text_color'])
-                                box_thickness = display_config['box_thickness']
-                                cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), box_color, box_thickness)
+                                # 使用PIL绘制中文文字（OpenCV不支持中文）
+                                # 将OpenCV图像转换为PIL图像
+                                pil_image = Image.fromarray(cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB))
+                                draw = ImageDraw.Draw(pil_image)
                                 
-                                # 获取类别名称并绘制文字
-                                if display_config.get('use_chinese', True):
-                                    # 使用中文显示
-                                    class_name = get_class_name_cn(cls_id)
-                                    label = f"{class_name} {conf:.2f} ID:{track_id}"
-                                    
-                                    # 使用PIL绘制中文文字（OpenCV不支持中文）
-                                    # 将OpenCV图像转换为PIL图像
-                                    pil_image = Image.fromarray(cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB))
-                                    draw = ImageDraw.Draw(pil_image)
-                                    
-                                    # 尝试加载中文字体
-                                    font = None
-                                    font_paths = [
-                                        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",  # 文泉驿微米黑
-                                        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",   # 文泉驿正黑
-                                        "/usr/share/fonts/truetype/arphic/uming.ttc",      # AR PL UMing
-                                        "/usr/share/fonts/truetype/arphic/ukai.ttc",      # AR PL UKai
-                                        "/System/Library/Fonts/PingFang.ttc",              # macOS
-                                        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf" # 备用
-                                    ]
-                                    
-                                    font_size = display_config['font_size']
-                                    for font_path in font_paths:
-                                        if os.path.exists(font_path):
-                                            try:
-                                                font = ImageFont.truetype(font_path, font_size)
-                                                break
-                                            except:
-                                                continue
-                                    
-                                    if font is None:
-                                        font = ImageFont.load_default()
-                                    
-                                    # 计算文字大小
-                                    bbox = draw.textbbox((0, 0), label, font=font)
-                                    text_width = bbox[2] - bbox[0]
-                                    text_height = bbox[3] - bbox[1]
-                                    
-                                    # 在PIL图像上绘制文字（根据是否在报警区域内使用不同颜色）
-                                    draw.text((x1 + 2, y1 - text_height - 3), label, fill=text_color_rgb, font=font)
-                                    
-                                    # 将PIL图像转换回OpenCV格式
-                                    annotated_frame = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
-                                else:
-                                    # 使用英文显示（OpenCV原生，性能更好）
-                                    class_name_en = model_classes[cls_id] if cls_id < len(model_classes) else f"class_{cls_id}"
-                                    label = f"{class_name_en} {conf:.2f} ID:{track_id}"
-                                    
-                                    # 使用OpenCV绘制文字（需要转换为BGR格式）
-                                    text_color_bgr = (text_color_rgb[2], text_color_rgb[1], text_color_rgb[0])  # RGB转BGR
-                                    font_scale = display_config['font_size'] / 20.0  # 调整字体大小比例
-                                    cv2.putText(annotated_frame, label, (x1 + 2, y1 - 5), 
-                                               cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_color_bgr, 2)
+                                # 尝试加载中文字体
+                                font = None
+                                font_paths = [
+                                    "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",  # 文泉驿微米黑
+                                    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",   # 文泉驿正黑
+                                    "/usr/share/fonts/truetype/arphic/uming.ttc",      # AR PL UMing
+                                    "/usr/share/fonts/truetype/arphic/ukai.ttc",      # AR PL UKai
+                                    "/System/Library/Fonts/PingFang.ttc",              # macOS
+                                    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf" # 备用
+                                ]
+                                
+                                font_size = display_config['font_size']
+                                for font_path in font_paths:
+                                    if os.path.exists(font_path):
+                                        try:
+                                            font = ImageFont.truetype(font_path, font_size)
+                                            break
+                                        except:
+                                            continue
+                                
+                                if font is None:
+                                    font = ImageFont.load_default()
+                                
+                                # 计算文字大小
+                                bbox = draw.textbbox((0, 0), label, font=font)
+                                text_width = bbox[2] - bbox[0]
+                                text_height = bbox[3] - bbox[1]
+                                
+                                # 在PIL图像上绘制文字（根据是否在报警区域内使用不同颜色）
+                                draw.text((x1 + 2, y1 - text_height - 3), label, fill=text_color_rgb, font=font)
+                                
+                                # 将PIL图像转换回OpenCV格式
+                                annotated_frame = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+                            else:
+                                # 使用英文显示（OpenCV原生，性能更好）
+                                class_name_en = model_classes[cls_id] if cls_id < len(model_classes) else f"class_{cls_id}"
+                                label = f"{class_name_en} {conf:.2f} ID:{track_id}"
+                                
+                                # 使用OpenCV绘制文字（需要转换为BGR格式）
+                                text_color_bgr = (text_color_rgb[2], text_color_rgb[1], text_color_rgb[0])  # RGB转BGR
+                                font_scale = display_config['font_size'] / 20.0  # 调整字体大小比例
+                                cv2.putText(annotated_frame, label, (x1 + 2, y1 - 5), 
+                                           cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_color_bgr, 2)
             
             # 绘制所有启用的区域
             enabled_zones = [z for z in zones if z.get('enabled', True) and len(z.get('points', [])) >= 3]
@@ -2321,63 +2339,73 @@ def detection_worker():
             }
             
             # 添加检测框信息（只包含启用的类别）
-            if results[0].boxes is not None and len(results[0].boxes) > 0:
-                boxes = results[0].boxes
-                track_ids = results[0].boxes.id
+            if results.boxes is not None and len(results.boxes) > 0:
+                boxes = results.boxes
+                track_ids = results.boxes.id
                 
-                if track_ids is not None:
-                    for i, box in enumerate(boxes):
-                        if not _box_has_valid_data(box):
-                            continue
-                        cls_id = int(box.cls[0])
-                        
-                        # 只处理启用的类别
-                        if is_class_enabled(cls_id):
-                            conf = float(box.conf[0])
-                            # 检查置信度是否满足阈值要求
-                            if check_confidence(cls_id, conf):
-                                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                                track_id = int(track_ids[i])
-                                bbox_center = [(x1 + x2) / 2, (y1 + y2) / 2]
-                                
-                                # 检查是否在任何一个启用的区域内
-                                in_zone = False
-                                zone_id = None
-                                enabled_zones = [z for z in zones if z.get('enabled', True) and len(z.get('points', [])) >= 3]
-                                if not enabled_zones:
-                                    in_zone = True
-                                    zone_id = 'full_frame'
-                                elif enabled_zones:
-                                    detection_mode = alarm_config.get('detection_mode', 'center')
-                                    for zone in enabled_zones:
-                                        zone_points = zone.get('points', [])
-                                        if len(zone_points) < 3:
-                                            continue
-                                        if detection_mode == 'center':
-                                            if is_point_in_polygon(bbox_center, zone_points):
-                                                in_zone = True
-                                                zone_id = zone.get('id')
-                                                break
-                                        elif detection_mode == 'edge':
-                                            if is_bbox_in_polygon([x1, y1, x2, y2], zone_points):
-                                                in_zone = True
-                                                zone_id = zone.get('id')
-                                                break
-                                
-                                detection_data["detections"].append({
-                                    "id": track_id,
-                                    "class_id": cls_id,
-                                    "class_name": model_classes[cls_id] if cls_id < len(model_classes) else f"class_{cls_id}",
-                                    "class_name_cn": get_class_name_cn(cls_id),
-                                    "bbox": [float(x1), float(y1), float(x2), float(y2)],
-                                    "center": {"x": float(bbox_center[0]), "y": float(bbox_center[1])},
-                                    "confidence": conf,
-                                    "in_zone": in_zone,
-                                    "zone_id": zone_id
-                                })
+                for i, box in enumerate(boxes):
+                    if not _box_has_valid_data(box):
+                        continue
+                    cls_id = int(box.cls[0])
+                    
+                    # 只处理启用的类别
+                    if is_class_enabled(cls_id):
+                        conf = float(box.conf[0])
+                        # 检查置信度是否满足阈值要求
+                        if check_confidence(cls_id, conf):
+                            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                            track_id = int(track_ids[i]) if track_ids is not None and i < len(track_ids) else -1
+                            bbox_center = [(x1 + x2) / 2, (y1 + y2) / 2]
+                            
+                            # 检查是否在任何一个启用的区域内
+                            in_zone = False
+                            zone_id = None
+                            enabled_zones = [z for z in zones if z.get('enabled', True) and len(z.get('points', [])) >= 3]
+                            if not enabled_zones:
+                                in_zone = True
+                                zone_id = 'full_frame'
+                            elif enabled_zones:
+                                detection_mode = alarm_config.get('detection_mode', 'center')
+                                for zone in enabled_zones:
+                                    zone_points = zone.get('points', [])
+                                    if len(zone_points) < 3:
+                                        continue
+                                    if detection_mode == 'center':
+                                        if is_point_in_polygon(bbox_center, zone_points):
+                                            in_zone = True
+                                            zone_id = zone.get('id')
+                                            break
+                                    elif detection_mode == 'edge':
+                                        if is_bbox_in_polygon([x1, y1, x2, y2], zone_points):
+                                            in_zone = True
+                                            zone_id = zone.get('id')
+                                            break
+                            
+                            detection_data["detections"].append({
+                                "id": track_id,
+                                "class_id": cls_id,
+                                "class_name": model_classes[cls_id] if cls_id < len(model_classes) else f"class_{cls_id}",
+                                "class_name_cn": get_class_name_cn(cls_id),
+                                "bbox": [float(x1), float(y1), float(x2), float(y2)],
+                                "center": {"x": float(bbox_center[0]), "y": float(bbox_center[1])},
+                                "confidence": conf,
+                                "in_zone": in_zone,
+                                "zone_id": zone_id
+                            })
             
             # 通过WebSocket发送给所有连接的客户端
             socketio.emit('frame', detection_data)
+
+            detection_processed_frames += 1
+            if detection_processed_frames % DETECTION_GC_INTERVAL_FRAMES == 0:
+                gc.collect()
+                if gpu_available:
+                    try:
+                        import torch
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except Exception:
+                        pass
             
         except queue.Empty:
             continue
