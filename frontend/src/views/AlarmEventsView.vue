@@ -107,12 +107,13 @@
                       fit="cover"
                       class="image-preview"
                       :preview-src-list="[event.image.media_url]"
+                      lazy
                       preview-teleported
                     />
                   </div>
                   <div class="media-block" v-if="event.video">
                     <div class="media-title">视频</div>
-                    <video :src="event.video.media_url" controls class="video-preview" />
+                    <video :src="event.video.media_url" controls preload="none" class="video-preview" />
                   </div>
                 </div>
                 <div class="doc-column">
@@ -165,6 +166,7 @@
                     fit="cover"
                     class="image-preview"
                     :preview-src-list="[event.image.media_url]"
+                    lazy
                     preview-teleported
                   />
                 </div>
@@ -174,7 +176,7 @@
                     <span>视频</span>
                     <el-button size="small" type="danger" link @click="handleDeleteSingle(event.video)">删除</el-button>
                   </div>
-                  <video :src="event.video.media_url" controls class="video-preview" />
+                  <video :src="event.video.media_url" controls preload="none" class="video-preview" />
                 </div>
               </div>
             </el-card>
@@ -218,7 +220,8 @@ const fetchEvents = async () => {
     const endTime = Array.isArray(timeRange.value) && timeRange.value[1] ? Number(timeRange.value[1]) / 1000 : undefined
     const res = await axios.get('/api/alarm-events', {
       params: {
-        limit: 300,
+        // 控制单次媒体数量，避免瞬时加载过多图片/视频导致内存压力
+        limit: 80,
         event_type: selectedEventType.value,
         start_time: startTime,
         end_time: endTime

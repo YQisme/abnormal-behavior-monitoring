@@ -75,7 +75,7 @@ backend_logger, yolo_logger, log_queue = setup_logging(BASE_DIR, socketio)
 # 全局变量（必须在日志发送线程之前定义）
 frame_queue = queue.Queue(maxsize=2)
 stop_flag = threading.Event()
-event_frame_buffer = deque(maxlen=900)  # 事件视频前缓存（约 30 秒 @30fps）
+event_frame_buffer = deque(maxlen=180)  # 事件视频前缓存（默认约 6 秒 @30fps，运行时会按配置动态调整）
 event_frame_buffer_lock = threading.Lock()
 
 # 日志发送线程
@@ -133,11 +133,13 @@ alarm_triggered = {}  # 记录已触发报警的跟踪ID，格式：{(track_id, 
 zone_has_people_mqtt_sent = False  # 是否已发送过 hasPeople:1，用于恢复时发送 hasPeople:0
 offpost_last_seen_person_ts = time.time()  # 离岗监测：最近一次检测到人的时间戳
 offpost_absence_alarm_sent = False  # 离岗监测：当前无人告警是否已触发
+offpost_recovery_candidate_ts = None  # 离岗监测：重新检测到人后，开始计时确认回岗的时间戳
 
 # 报警配置
 alarm_config = {
     "debounce_time": 5.0,  # 防抖时间（秒），同一目标在此时间内只报警一次
     "offpost_absence_duration": 10.0,  # 离岗监测：持续无人多久后报警（秒）
+    "offpost_recovery_duration": 2.0,  # 离岗监测：持续检测到人多久后才判定回岗（秒）
     "detection_mode": "center",  # 检测模式："center"=中心点，"edge"=边框任意点
     "once_per_id": False,  # 相同ID是否只报警一次（True=整个生命周期只报警一次，False=允许重复报警）
     "popup_alarm_enabled": True,  # 是否开启弹窗报警
@@ -887,6 +889,7 @@ def load_alarm_config(profile=None):
     alarm_config = {
         "debounce_time": 5.0,
         "offpost_absence_duration": 10.0,
+        "offpost_recovery_duration": 2.0,
         "detection_mode": "center",
         "once_per_id": False,
         "popup_alarm_enabled": True,
@@ -912,6 +915,8 @@ def load_alarm_config(profile=None):
                     alarm_config['detection_mode'] = config['detection_mode']
                 if 'offpost_absence_duration' in config:
                     alarm_config['offpost_absence_duration'] = max(0.0, float(config['offpost_absence_duration']))
+                if 'offpost_recovery_duration' in config:
+                    alarm_config['offpost_recovery_duration'] = max(0.0, float(config['offpost_recovery_duration']))
                 if 'once_per_id' in config:
                     alarm_config['once_per_id'] = bool(config['once_per_id'])
                 if 'popup_alarm_enabled' in config:
@@ -1223,11 +1228,40 @@ def _box_has_valid_data(box):
 
 def _resolve_event_type_dir(event_type):
     """将事件类型映射到固定目录名，保证不同类型事件分目录保存。"""
-    if event_type == "offpost_absence":
+    if event_type in ("offpost_absence", "offpost_recovery"):
         return "offpost"
     if event_type == "drowsy":
         return "drowsy"
     return "zone"
+
+
+def _get_event_frame_buffer_maxlen():
+    """根据预录秒数和FPS估算事件前缓存上限，避免长期占用过大内存。"""
+    pre_seconds_cfg = float(alarm_config.get('event_video_pre_seconds', 5.0))
+    pre_seconds = max(0.0, min(pre_seconds_cfg, 15.0))
+    fps = float(video_info.get("fps", 0.0))
+    if fps <= 0:
+        fps = 15.0
+    fps = min(max(fps, 5.0), 30.0)
+    # 额外加 1 秒余量，且设置硬上限，避免高分辨率场景下缓存过大
+    estimated = int((pre_seconds + 1.0) * fps)
+    return max(30, min(estimated, 240))
+
+
+def _update_event_frame_buffer(frame):
+    """按需缓存事件前帧：关闭事件视频时不缓存，开启时按动态上限缓存。"""
+    global event_frame_buffer
+    if not alarm_config.get('save_event_video', True):
+        with event_frame_buffer_lock:
+            if len(event_frame_buffer) > 0:
+                event_frame_buffer.clear()
+        return
+
+    target_maxlen = _get_event_frame_buffer_maxlen()
+    with event_frame_buffer_lock:
+        if event_frame_buffer.maxlen != target_maxlen:
+            event_frame_buffer = deque(event_frame_buffer, maxlen=target_maxlen)
+        event_frame_buffer.append((time.time(), frame.copy()))
 
 
 def save_alarm_event_video(track_id, zone_id, zone_name, class_id, class_name_cn, bbox_center, event_type="zone"):
@@ -1631,6 +1665,46 @@ def trigger_offpost_absence_alarm(absence_duration, zone_name='当前区域'):
     return True
 
 
+def trigger_offpost_recovery_alarm(absence_duration, zone_name='当前区域'):
+    """离岗监测：人员重新出现时触发恢复报警"""
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    event_video_filename = None
+    event_image_filename = None
+    offpost_track_id = -1
+    offpost_zone_id = "offpost"
+    offpost_center = [0.0, 0.0]
+    offpost_title = "人员在岗"
+    if alarm_config.get('save_event_video', True):
+        event_video_filename = save_alarm_event_video(
+            offpost_track_id, offpost_zone_id, zone_name, None, offpost_title, offpost_center, event_type="offpost_recovery"
+        )
+    if alarm_config.get('save_event_image', True):
+        event_image_filename = save_alarm_event_image(
+            offpost_track_id, offpost_zone_id, zone_name, None, offpost_title, offpost_center, event_type="offpost_recovery"
+        )
+
+    alarm_data = {
+        "time": current_time,
+        "track_id": offpost_track_id,
+        "class_id": None,
+        "class_name_cn": offpost_title,
+        "object_name": offpost_title,
+        "zone_id": offpost_zone_id,
+        "zone_name": zone_name,
+        "position": {"x": offpost_center[0], "y": offpost_center[1]},
+        "event_video": event_video_filename,
+        "event_image": event_image_filename,
+        "absence_duration": round(float(absence_duration), 2),
+        "popup_alarm_enabled": bool(alarm_config.get('popup_alarm_enabled', True)),
+        "sound_light_alarm_enabled": bool(alarm_config.get('sound_light_alarm_enabled', True)),
+        "alarm_type": "offpost_recovery"
+    }
+
+    socketio.emit('alarm', alarm_data)
+    backend_logger.info(f"✅ 人员回岗！区域【{zone_name}】本次离岗持续 {absence_duration:.2f} 秒，时间: {current_time}")
+    return True
+
+
 def drowsy_dist(p1, p2):
     """计算二维点距离"""
     return math.hypot(float(p1[0]) - float(p2[0]), float(p1[1]) - float(p2[1]))
@@ -1941,7 +2015,7 @@ def video_reader():
 
 def detection_worker():
     """检测工作线程"""
-    global latest_frame, latest_results, latest_annotated_frame, zones, fps_counter, display_config, zone_has_people_mqtt_sent, inference_running, offpost_last_seen_person_ts, offpost_absence_alarm_sent, inference_running_profiles, drowsy_last_state, detection_processed_frames
+    global latest_frame, latest_results, latest_annotated_frame, zones, fps_counter, display_config, zone_has_people_mqtt_sent, inference_running, offpost_last_seen_person_ts, offpost_absence_alarm_sent, offpost_recovery_candidate_ts, inference_running_profiles, drowsy_last_state, detection_processed_frames
     
     while not stop_flag.is_set():
         try:
@@ -2070,17 +2144,30 @@ def detection_worker():
                                         break  # 区域模式下只对第一个匹配的区域报警
                 if current_detection_profile == DETECTION_PROFILE_OFFPOST:
                     current_ts = time.time()
+                    target_zone_name = enabled_zones[0].get('name', '当前区域') if enabled_zones else '当前区域'
                     if person_in_zone_this_frame:
-                        offpost_last_seen_person_ts = current_ts
-                        offpost_absence_alarm_sent = False
+                        if offpost_absence_alarm_sent:
+                            # 进入回岗确认阶段：需连续检测到人达到阈值，才认为真正回岗（防抖）
+                            if offpost_recovery_candidate_ts is None:
+                                offpost_recovery_candidate_ts = current_ts
+                            recovery_confirm_duration = float(alarm_config.get('offpost_recovery_duration', 2.0))
+                            if current_ts - offpost_recovery_candidate_ts >= recovery_confirm_duration:
+                                recovery_absence_duration = offpost_recovery_candidate_ts - offpost_last_seen_person_ts
+                                trigger_offpost_recovery_alarm(recovery_absence_duration, target_zone_name)
+                                offpost_last_seen_person_ts = current_ts
+                                offpost_absence_alarm_sent = False
+                                offpost_recovery_candidate_ts = None
+                        else:
+                            offpost_last_seen_person_ts = current_ts
+                            offpost_recovery_candidate_ts = None
                         if not zone_has_people_mqtt_sent:
                             send_mqtt_message({"hasPeople": 1})
                             zone_has_people_mqtt_sent = True
                     else:
+                        offpost_recovery_candidate_ts = None
                         absence_duration = current_ts - offpost_last_seen_person_ts
                         threshold = float(alarm_config.get('offpost_absence_duration', 10.0))
                         if absence_duration >= threshold:
-                            target_zone_name = enabled_zones[0].get('name', '当前区域') if enabled_zones else '当前区域'
                             trigger_offpost_absence_alarm(absence_duration, target_zone_name)
                 else:
                     # 本帧无人进入任何区域且此前已发送过 hasPeople:1 时，发送恢复消息
@@ -2308,8 +2395,7 @@ def detection_worker():
                     2
                 )
             latest_annotated_frame = annotated_frame.copy()
-            with event_frame_buffer_lock:
-                event_frame_buffer.append((time.time(), latest_annotated_frame.copy()))
+            _update_event_frame_buffer(latest_annotated_frame)
             
             # 编码为JPEG
             _, buffer = cv2.imencode('.jpg', annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
@@ -2536,7 +2622,7 @@ def save_zones_config(profile=None):
 
 def ensure_detection_profile(profile):
     """切换并加载指定检测档案配置"""
-    global current_detection_profile, alarm_triggered, zone_has_people_mqtt_sent, offpost_last_seen_person_ts, offpost_absence_alarm_sent, drowsy_eye_low_frames, drowsy_yawn_high_frames, drowsy_last_state, drowsy_last_alarm_state
+    global current_detection_profile, alarm_triggered, zone_has_people_mqtt_sent, offpost_last_seen_person_ts, offpost_absence_alarm_sent, offpost_recovery_candidate_ts, drowsy_eye_low_frames, drowsy_yawn_high_frames, drowsy_last_state, drowsy_last_alarm_state
 
     if profile not in DETECTION_PROFILE_FILES:
         raise ValueError("未知检测档案")
@@ -2552,6 +2638,7 @@ def ensure_detection_profile(profile):
     zone_has_people_mqtt_sent = False
     offpost_last_seen_person_ts = time.time()
     offpost_absence_alarm_sent = False
+    offpost_recovery_candidate_ts = None
     drowsy_eye_low_frames = 0
     drowsy_yawn_high_frames = 0
     drowsy_ear_hist.clear()
@@ -3527,7 +3614,7 @@ def get_mqtt_config():
 def clear_alarm_mqtt():
     """清除报警信息：仅清除服务端报警记录，不发送 MQTT 消息"""
     global alarm_triggered, occlusion_alarm_triggered, camera_offline_alarm_triggered
-    global zone_has_people_mqtt_sent, occlusion_mqtt_1_sent, offpost_absence_alarm_sent, offpost_last_seen_person_ts
+    global zone_has_people_mqtt_sent, occlusion_mqtt_1_sent, offpost_absence_alarm_sent, offpost_last_seen_person_ts, offpost_recovery_candidate_ts
     try:
         alarm_triggered.clear()
         occlusion_alarm_triggered.clear()
@@ -3536,6 +3623,7 @@ def clear_alarm_mqtt():
         occlusion_mqtt_1_sent = False
         offpost_absence_alarm_sent = False
         offpost_last_seen_person_ts = time.time()
+        offpost_recovery_candidate_ts = None
         # 通知所有前端客户端清空当前报警列表
         socketio.emit('alarm_cleared', {'time': datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
         return jsonify({"success": True, "message": "报警记录已清除"})
@@ -4131,6 +4219,12 @@ def set_alarm_config():
             if offpost_absence_duration < 0:
                 return jsonify({"success": False, "message": "离岗无人报警时长不能为负数"}), 400
             alarm_config['offpost_absence_duration'] = offpost_absence_duration
+
+        if 'offpost_recovery_duration' in data:
+            offpost_recovery_duration = float(data['offpost_recovery_duration'])
+            if offpost_recovery_duration < 0:
+                return jsonify({"success": False, "message": "回岗确认时长不能为负数"}), 400
+            alarm_config['offpost_recovery_duration'] = offpost_recovery_duration
         
         if 'detection_mode' in data:
             detection_mode = data['detection_mode']

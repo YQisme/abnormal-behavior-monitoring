@@ -420,6 +420,18 @@
               离岗监测中，连续未检测到人达到该时长后触发报警
             </span>
           </el-form-item>
+          <el-form-item v-if="isOffpostMode" label="回岗确认时长（秒）">
+            <el-input-number
+              v-model="alarmForm.offpost_recovery_duration"
+              :min="0"
+              :max="60"
+              :step="0.1"
+              :precision="1"
+            />
+            <span style="margin-left: 10px; color: #666; font-size: 12px">
+              离岗后重新检测到人时，需连续检测到该时长才判定回岗并触发恢复报警
+            </span>
+          </el-form-item>
           <el-form-item v-if="isDrowsyMode" label="EAR 阈值">
             <el-input-number
               v-model="alarmForm.drowsy_ear_threshold"
@@ -629,6 +641,7 @@ const displayForm = ref({
 const alarmForm = ref({
   debounce_time: 5.0,
   offpost_absence_duration: 10.0,
+  offpost_recovery_duration: 2.0,
   detection_mode: 'center',
   drowsy_ear_threshold: 0.20,
   drowsy_mar_threshold: 0.60,
@@ -1004,6 +1017,9 @@ const loadAlarmConfig = async () => {
     }
     if (res.data.offpost_absence_duration !== undefined) {
       alarmForm.value.offpost_absence_duration = res.data.offpost_absence_duration
+    }
+    if (res.data.offpost_recovery_duration !== undefined) {
+      alarmForm.value.offpost_recovery_duration = res.data.offpost_recovery_duration
     }
     if (res.data.detection_mode !== undefined) {
       alarmForm.value.detection_mode = res.data.detection_mode
@@ -1469,6 +1485,7 @@ const applyAlarm = async () => {
     }
     if (isOffpostMode.value) {
       payload.offpost_absence_duration = alarmForm.value.offpost_absence_duration
+      payload.offpost_recovery_duration = alarmForm.value.offpost_recovery_duration
     }
     if (isDrowsyMode.value) {
       payload.drowsy_ear_threshold = alarmForm.value.drowsy_ear_threshold

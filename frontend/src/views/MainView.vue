@@ -251,7 +251,8 @@ onMounted(() => {
     : window.location.origin
   
   socket = io(socketUrl, {
-    transports: ['websocket', 'polling'],
+    // 在当前 Flask/threading 部署下优先使用 long-polling，避免 websocket 握手 500
+    transports: ['polling'],
     reconnection: true,
     reconnectionDelay: 1000,
     reconnectionAttempts: 5
@@ -391,13 +392,17 @@ const normalizeObjectName = (name) => {
 }
 
 const buildAlarmText = (alarm) => {
-  const zoneName = alarm?.zone_name ? `，${alarm.zone_name}` : ''
+  const zoneName = alarm?.zone_name ? `${alarm.zone_name}` : ''
   if (alarm?.alarm_type === 'offpost_absence') {
     const duration = alarm?.absence_duration !== undefined ? `${Number(alarm.absence_duration).toFixed(1)}秒` : '持续无人'
-    return `离岗报警${zoneName}，${duration}`
+    return `${zoneName}已${duration}未检测到人员，疑似离岗`
+  }
+  if (alarm?.alarm_type === 'offpost_recovery') {
+    const duration = alarm?.absence_duration !== undefined ? `${Number(alarm.absence_duration).toFixed(1)}秒` : '一段时间'
+    return `${zoneName}已离岗${duration}`
   }
   if (alarm?.alarm_type === 'drowsy') {
-    return `瞌睡报警${zoneName}，${toChineseDrowsyState(alarm?.drowsy_state)}`
+    return `${zoneName}瞌睡报警，${toChineseDrowsyState(alarm?.drowsy_state)}`
   }
   return `${normalizeObjectName(alarm?.class_name_cn || alarm?.object_name)}进入监控区域${zoneName}`
 }

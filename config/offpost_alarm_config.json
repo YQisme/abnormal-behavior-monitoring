@@ -1,6 +1,7 @@
 {
   "debounce_time": 5.0,
   "offpost_absence_duration": 10.0,
+  "offpost_recovery_duration": 2.0,
   "detection_mode": "center",
   "once_per_id": false,
   "popup_alarm_enabled": true,
