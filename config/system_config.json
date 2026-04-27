@@ -1,5 +1,5 @@
 {
-  "model": "yolo26m_640_fp32.engine",
+  "model": "yolo11m.pt",
   "imgsz": 640,
   "video_url": "0",
   "camera_ip": "",

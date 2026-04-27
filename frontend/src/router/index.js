@@ -4,6 +4,7 @@ import HomeView from '../views/HomeView.vue'
 import VideoMonitor from '../components/VideoMonitor.vue'
 import LoginView from '../views/LoginView.vue'
 import SystemSettingsView from '../views/SystemSettingsView.vue'
+import AlarmEventsView from '../views/AlarmEventsView.vue'
 import axios from 'axios'
 
 const routes = [
@@ -41,6 +42,12 @@ const routes = [
     path: '/monitor',
     name: 'Monitor',
     component: VideoMonitor,
+    meta: { requiresAuth: true }
+  },
+  {
+    path: '/alarm-events',
+    name: 'AlarmEvents',
+    component: AlarmEventsView,
     meta: { requiresAuth: true }
   },
   {

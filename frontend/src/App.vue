@@ -40,14 +40,15 @@
 <script setup>
 import { computed, ref, onMounted, onUnmounted } from 'vue'
 import { useRoute } from 'vue-router'
-import { WarningFilled, UserFilled, CoffeeCup } from '@element-plus/icons-vue'
+import { WarningFilled, UserFilled, CoffeeCup, BellFilled } from '@element-plus/icons-vue'
 
 const MENU_LAYOUT_KEY = 'monitor_menu_layout'
 
 const defaultMonitorMenus = [
   { path: '/zone-alarm', label: '区域报警', icon: WarningFilled, visible: true },
   { path: '/leave-monitor', label: '离岗监测', icon: UserFilled, visible: true },
-  { path: '/drowsy-monitor', label: '瞌睡监测', icon: CoffeeCup, visible: true }
+  { path: '/drowsy-monitor', label: '瞌睡监测', icon: CoffeeCup, visible: true },
+  { path: '/alarm-events', label: '报警事件', icon: BellFilled, visible: true }
 ]
 
 const route = useRoute()

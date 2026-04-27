@@ -31,7 +31,8 @@ const MENU_LAYOUT_KEY = 'monitor_menu_layout'
 const defaultMenus = [
   { path: '/zone-alarm', label: '区域报警', buttonType: 'primary', visible: true },
   { path: '/leave-monitor', label: '离岗监测', buttonType: 'warning', visible: true },
-  { path: '/drowsy-monitor', label: '瞌睡监测', buttonType: 'success', visible: true }
+  { path: '/drowsy-monitor', label: '瞌睡监测', buttonType: 'success', visible: true },
+  { path: '/alarm-events', label: '报警事件', buttonType: 'danger', visible: true }
 ]
 const monitorMenus = ref([...defaultMenus])
 

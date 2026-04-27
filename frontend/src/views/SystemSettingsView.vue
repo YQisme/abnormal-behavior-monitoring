@@ -17,7 +17,7 @@
         <div class="layout-card" v-if="activeSettingsTab === 'layout'">
           <div class="layout-header">
             <h3>页面板块排版</h3>
-            <span>可调整左侧“区域报警 / 离岗监测 / 瞌睡监测”的顺序与显示状态</span>
+            <span>可调整左侧监测模块（含报警事件）的顺序与显示状态</span>
           </div>
           <div class="layout-list">
             <div class="layout-row" v-for="(item, index) in menuLayout" :key="item.path">
@@ -59,7 +59,8 @@ const MENU_LAYOUT_KEY = 'monitor_menu_layout'
 const defaultLayout = [
   { path: '/zone-alarm', label: '区域报警', visible: true },
   { path: '/leave-monitor', label: '离岗监测', visible: true },
-  { path: '/drowsy-monitor', label: '瞌睡监测', visible: true }
+  { path: '/drowsy-monitor', label: '瞌睡监测', visible: true },
+  { path: '/alarm-events', label: '报警事件', visible: true }
 ]
 const menuLayout = ref(loadLayout())
 const activeSettingsTab = ref(resolveTab(route.params.tab))

@@ -9,6 +9,7 @@
   },
   "drowsy_monitor": {
     "model": "yolo26m_640_fp32.engine",
-    "imgsz": 640
+    "imgsz": 640,
+    "task_model": "face_landmarker.task"
   }
 }

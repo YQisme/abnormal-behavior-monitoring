@@ -19,6 +19,7 @@ import subprocess
 import signal
 import re
 import socket
+from urllib.parse import quote, unquote
 from collections import deque
 try:
     import paho.mqtt.client as mqtt
@@ -4174,6 +4175,159 @@ def set_alarm_config():
         return jsonify({"success": False, "message": "参数格式错误"}), 400
     except Exception as e:
         return jsonify({"success": False, "message": f"设置失败: {str(e)}"}), 500
+
+
+@app.route('/api/alarm-events', methods=['GET'])
+def list_alarm_events():
+    """列出报警事件图片/视频文件"""
+    try:
+        event_root = alarm_config.get('event_save_path', os.path.join(BASE_DIR, "alarm_events"))
+        event_root = os.path.abspath(event_root)
+        os.makedirs(event_root, exist_ok=True)
+
+        media_type = (request.args.get('type') or 'all').strip().lower()
+        if media_type not in ('all', 'image', 'video'):
+            return jsonify({"success": False, "message": "type 参数必须是 all/image/video"}), 400
+
+        try:
+            limit = int(request.args.get('limit', 200))
+        except (TypeError, ValueError):
+            limit = 200
+        limit = max(1, min(limit, 1000))
+
+        image_exts = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
+        video_exts = {'.mp4', '.avi', '.mov', '.mkv', '.webm'}
+        items = []
+
+        for root, _, files in os.walk(event_root):
+            for filename in files:
+                # 转码过程产生的临时/缓存文件不在页面展示，避免重复
+                if filename.endswith('_web.mp4'):
+                    continue
+                ext = os.path.splitext(filename)[1].lower()
+                item_type = None
+                if ext in image_exts:
+                    item_type = 'image'
+                elif ext in video_exts:
+                    item_type = 'video'
+
+                if item_type is None:
+                    continue
+                if media_type != 'all' and media_type != item_type:
+                    continue
+
+                full_path = os.path.join(root, filename)
+                rel_path = os.path.relpath(full_path, event_root).replace(os.sep, '/')
+
+                try:
+                    stat = os.stat(full_path)
+                except OSError:
+                    continue
+
+                rel_parts = rel_path.split('/')
+                event_type = rel_parts[0] if len(rel_parts) > 2 else 'unknown'
+                items.append({
+                    "name": filename,
+                    "relative_path": rel_path,
+                    "media_type": item_type,
+                    "event_type": event_type,
+                    "size": stat.st_size,
+                    "modified_at": stat.st_mtime,
+                    "media_url": f"/api/alarm-events/media/{quote(rel_path, safe='/')}"
+                })
+
+        items.sort(key=lambda x: x.get("modified_at", 0), reverse=True)
+
+        return jsonify({
+            "success": True,
+            "total": len(items),
+            "items": items[:limit],
+            "event_root": event_root
+        })
+    except Exception as e:
+        backend_logger.error(f"获取报警事件列表失败: {e}")
+        return jsonify({"success": False, "message": f"获取失败: {str(e)}"}), 500
+
+
+@app.route('/api/alarm-events/media/<path:relative_path>', methods=['GET'])
+def get_alarm_event_media(relative_path):
+    """提供报警事件媒体文件访问"""
+    try:
+        event_root = alarm_config.get('event_save_path', os.path.join(BASE_DIR, "alarm_events"))
+        event_root = os.path.abspath(event_root)
+        os.makedirs(event_root, exist_ok=True)
+
+        safe_relative_path = unquote(relative_path).replace('\\', '/').lstrip('/')
+        abs_target = os.path.abspath(os.path.join(event_root, safe_relative_path))
+        if not abs_target.startswith(event_root + os.sep):
+            return jsonify({"success": False, "message": "非法路径"}), 400
+        if not os.path.isfile(abs_target):
+            return jsonify({"success": False, "message": "文件不存在"}), 404
+
+        # 某些浏览器（特别是 Linux 环境）对 mp4v/mpeg4 编码兼容性差。
+        # 首次访问时按需转码为 H.264，并直接覆盖原文件，避免出现 *_web 重复文件。
+        ext = os.path.splitext(abs_target)[1].lower()
+        if ext == '.mp4':
+            def _get_video_codec(path):
+                try:
+                    result = subprocess.run(
+                        [
+                            'ffprobe',
+                            '-v', 'error',
+                            '-select_streams', 'v:0',
+                            '-show_entries', 'stream=codec_name',
+                            '-of', 'default=noprint_wrappers=1:nokey=1',
+                            path
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=8
+                    )
+                    return result.stdout.strip().lower() if result.returncode == 0 else ''
+                except Exception:
+                    return ''
+
+            codec_name = _get_video_codec(abs_target)
+            if codec_name == 'mpeg4':
+                base, _ = os.path.splitext(abs_target)
+                temp_target = f"{base}.__transcoding__.mp4"
+                try:
+                    backend_logger.info(f"开始转码报警事件视频为 Web 兼容格式: {abs_target}")
+                    cmd = [
+                        'ffmpeg', '-y',
+                        '-i', abs_target,
+                        '-c:v', 'libx264',
+                        '-pix_fmt', 'yuv420p',
+                        '-movflags', '+faststart',
+                        '-an',
+                        temp_target
+                    ]
+                    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                    if proc.returncode != 0 or (not os.path.exists(temp_target)) or os.path.getsize(temp_target) <= 1024:
+                        backend_logger.error(f"报警事件视频转码失败: {proc.stderr[-500:] if proc.stderr else 'unknown error'}")
+                        if os.path.exists(temp_target):
+                            try:
+                                os.remove(temp_target)
+                            except Exception:
+                                pass
+                    else:
+                        os.replace(temp_target, abs_target)
+                        backend_logger.info(f"报警事件视频转码完成并覆盖原文件: {abs_target}")
+                except Exception as transcode_error:
+                    backend_logger.error(f"报警事件视频转码异常: {transcode_error}")
+                    if os.path.exists(temp_target):
+                        try:
+                            os.remove(temp_target)
+                        except Exception:
+                            pass
+
+        rel_for_send = os.path.relpath(abs_target, event_root).replace(os.sep, '/')
+        dir_name = os.path.dirname(rel_for_send)
+        file_name = os.path.basename(rel_for_send)
+        return send_from_directory(os.path.join(event_root, dir_name), file_name, as_attachment=False)
+    except Exception as e:
+        backend_logger.error(f"读取报警事件媒体失败: {e}")
+        return jsonify({"success": False, "message": f"读取失败: {str(e)}"}), 500
 
 if __name__ == '__main__':
     backend_logger.info("="*60)
