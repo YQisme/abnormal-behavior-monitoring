@@ -139,6 +139,8 @@ alarm_config = {
     "offpost_absence_duration": 10.0,  # 离岗监测：持续无人多久后报警（秒）
     "detection_mode": "center",  # 检测模式："center"=中心点，"edge"=边框任意点
     "once_per_id": False,  # 相同ID是否只报警一次（True=整个生命周期只报警一次，False=允许重复报警）
+    "popup_alarm_enabled": True,  # 是否开启弹窗报警
+    "sound_light_alarm_enabled": True,  # 是否开启声光报警（通过MQTT下发）
     "save_event_video": True,  # 是否保存报警事件视频
     "save_event_image": True,  # 是否保存报警事件图片
     "event_video_duration": 10,  # 报警事件视频时长（秒）
@@ -884,6 +886,8 @@ def load_alarm_config(profile=None):
         "offpost_absence_duration": 10.0,
         "detection_mode": "center",
         "once_per_id": False,
+        "popup_alarm_enabled": True,
+        "sound_light_alarm_enabled": True,
         "save_event_video": True,
         "save_event_image": True,
         "event_video_duration": 10,
@@ -907,6 +911,10 @@ def load_alarm_config(profile=None):
                     alarm_config['offpost_absence_duration'] = max(0.0, float(config['offpost_absence_duration']))
                 if 'once_per_id' in config:
                     alarm_config['once_per_id'] = bool(config['once_per_id'])
+                if 'popup_alarm_enabled' in config:
+                    alarm_config['popup_alarm_enabled'] = bool(config['popup_alarm_enabled'])
+                if 'sound_light_alarm_enabled' in config:
+                    alarm_config['sound_light_alarm_enabled'] = bool(config['sound_light_alarm_enabled'])
                 if 'save_event_video' in config:
                     alarm_config['save_event_video'] = bool(config['save_event_video'])
                 if 'save_event_image' in config:
@@ -1562,16 +1570,14 @@ def trigger_alarm(track_id, bbox_center, zone_id, zone_name, class_id=None, clas
         "position": {"x": float(bbox_center[0]), "y": float(bbox_center[1])},
         "event_video": event_video_filename,
         "event_image": event_image_filename,
+        "popup_alarm_enabled": bool(alarm_config.get('popup_alarm_enabled', True)),
+        "sound_light_alarm_enabled": bool(alarm_config.get('sound_light_alarm_enabled', True)),
         "alarm_type": "zone"  # 报警类型：区域报警
     }
     
-    # 通过WebSocket发送报警信息
+    # 报警事件统一推送给前端；前端按开关执行弹窗/声光动作
     socketio.emit('alarm', alarm_data)
     backend_logger.warning(f"⚠️  报警！{object_name}进入监控区域【{zone_name}】！时间: {current_time}, ID: {track_id}")
-    
-    # 发送MQTT消息
-    send_mqtt_message({"hasPeople": 1})
-    zone_has_people_mqtt_sent = True
     
     return True
 
@@ -1611,13 +1617,13 @@ def trigger_offpost_absence_alarm(absence_duration, zone_name='当前区域'):
         "event_video": event_video_filename,
         "event_image": event_image_filename,
         "absence_duration": round(float(absence_duration), 2),
+        "popup_alarm_enabled": bool(alarm_config.get('popup_alarm_enabled', True)),
+        "sound_light_alarm_enabled": bool(alarm_config.get('sound_light_alarm_enabled', True)),
         "alarm_type": "offpost_absence"
     }
 
     socketio.emit('alarm', alarm_data)
     backend_logger.warning(f"⚠️  离岗报警！区域【{zone_name}】已持续无人 {absence_duration:.2f} 秒，时间: {current_time}")
-    send_mqtt_message({"hasPeople": 0})
-    zone_has_people_mqtt_sent = False
     offpost_absence_alarm_sent = True
     return True
 
@@ -1749,6 +1755,8 @@ def trigger_drowsy_alarm(state, ear_value, mar_value, zone_name="当前区域"):
         "position": {"x": drowsy_center[0], "y": drowsy_center[1]},
         "event_video": event_video_filename,
         "event_image": event_image_filename,
+        "popup_alarm_enabled": bool(alarm_config.get('popup_alarm_enabled', True)),
+        "sound_light_alarm_enabled": bool(alarm_config.get('sound_light_alarm_enabled', True)),
         "alarm_type": "drowsy",
         "drowsy_state": state,
         "ear": round(float(ear_value), 3),
@@ -4110,6 +4118,12 @@ def set_alarm_config():
             # 如果启用"相同ID只报警一次"，清空之前的报警记录
             if once_per_id:
                 alarm_triggered.clear()
+
+        if 'popup_alarm_enabled' in data:
+            alarm_config['popup_alarm_enabled'] = bool(data['popup_alarm_enabled'])
+
+        if 'sound_light_alarm_enabled' in data:
+            alarm_config['sound_light_alarm_enabled'] = bool(data['sound_light_alarm_enabled'])
         
         if 'save_event_video' in data:
             alarm_config['save_event_video'] = bool(data['save_event_video'])

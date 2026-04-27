@@ -2,6 +2,8 @@
   "debounce_time": 5.0,
   "detection_mode": "edge",
   "once_per_id": false,
+  "popup_alarm_enabled": true,
+  "sound_light_alarm_enabled": true,
   "save_event_video": false,
   "save_event_image": false,
   "event_video_duration": 5,

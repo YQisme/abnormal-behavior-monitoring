@@ -3,6 +3,8 @@
   "offpost_absence_duration": 10.0,
   "detection_mode": "center",
   "once_per_id": false,
+  "popup_alarm_enabled": true,
+  "sound_light_alarm_enabled": true,
   "save_event_video": true,
   "save_event_image": true,
   "event_video_duration": 10,

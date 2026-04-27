@@ -20,6 +20,13 @@
 
       <!-- 主内容区 -->
       <el-main class="main-content">
+        <div v-if="flashRedActive" class="alarm-flash-overlay">
+          <div v-if="flashConfirmVisible" class="flash-confirm-card">
+            <div class="flash-confirm-title">声光报警</div>
+            <div class="flash-confirm-text">{{ flashConfirmText }}</div>
+            <el-button type="danger" @click="confirmFlashAlarm">确认关闭报警</el-button>
+          </div>
+        </div>
         <!-- 上方：视频 + 监控信息 -->
         <el-row :gutter="20" class="video-row">
           <el-col :span="16">
@@ -132,7 +139,7 @@
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { io } from 'socket.io-client'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import axios from 'axios'
 import ConfigPanel from '../components/ConfigPanel.vue'
 import VideoPanel from '../components/VideoPanel.vue'
@@ -175,6 +182,12 @@ const activeInfoTab = ref('alarm')  // 信息标签：alarm/detection
 const videoPanelRef = ref(null)
 const loginEnabled = ref(true)  // 是否启用登录
 const clearAlarmMqttLoading = ref(false)
+const flashRedActive = ref(false)
+const flashConfirmVisible = ref(false)
+const flashConfirmText = ref('')
+let flashConfirmResolver = null
+let alarmActionRunning = false
+const pendingAlarmQueue = []
 
 // Socket.IO 连接
 let socket = null
@@ -293,6 +306,7 @@ onMounted(() => {
     if (alarms.value.length > 20) {
       alarms.value.pop()
     }
+    runAlarmActions(data)
   })
   
   socket.on('alarm_cleared', () => {
@@ -332,6 +346,14 @@ onUnmounted(() => {
   if (socket) {
     socket.disconnect()
   }
+  closeFlashRed()
+  if (flashConfirmResolver) {
+    flashConfirmResolver()
+    flashConfirmResolver = null
+  }
+  if (typeof window !== 'undefined' && window.speechSynthesis) {
+    window.speechSynthesis.cancel()
+  }
 })
 
 watch(() => route.path, () => {
@@ -349,6 +371,120 @@ const handleZonesUpdated = async () => {
     }
   } catch (error) {
     console.error('加载区域失败:', error)
+  }
+}
+
+const toChineseDrowsyState = (state) => {
+  if (state === 'Drowsy + Yawning') return '疑似瞌睡并打哈欠'
+  if (state === 'Drowsy') return '疑似瞌睡'
+  if (state === 'Yawning') return '频繁打哈欠'
+  return '状态异常'
+}
+
+const normalizeObjectName = (name) => {
+  const text = String(name || '').trim()
+  if (!text) return '目标'
+  if (/[A-Za-z]/.test(text) && !/[\u4e00-\u9fa5]/.test(text)) {
+    return '目标'
+  }
+  return text
+}
+
+const buildAlarmText = (alarm) => {
+  const zoneName = alarm?.zone_name ? `，${alarm.zone_name}` : ''
+  if (alarm?.alarm_type === 'offpost_absence') {
+    const duration = alarm?.absence_duration !== undefined ? `${Number(alarm.absence_duration).toFixed(1)}秒` : '持续无人'
+    return `离岗报警${zoneName}，${duration}`
+  }
+  if (alarm?.alarm_type === 'drowsy') {
+    return `瞌睡报警${zoneName}，${toChineseDrowsyState(alarm?.drowsy_state)}`
+  }
+  return `${normalizeObjectName(alarm?.class_name_cn || alarm?.object_name)}进入监控区域${zoneName}`
+}
+
+const triggerFlashRed = (text, needManualConfirm) => {
+  flashRedActive.value = true
+  flashConfirmText.value = text
+  flashConfirmVisible.value = !!needManualConfirm
+}
+
+const closeFlashRed = () => {
+  flashRedActive.value = false
+  flashConfirmVisible.value = false
+  flashConfirmText.value = ''
+}
+
+const waitFlashConfirm = () => new Promise((resolve) => {
+  flashConfirmResolver = resolve
+})
+
+const confirmFlashAlarm = () => {
+  if (flashConfirmResolver) {
+    flashConfirmResolver()
+    flashConfirmResolver = null
+  }
+  closeFlashRed()
+}
+
+const speakAlarm = (text) => {
+  if (!text || typeof window === 'undefined' || !window.speechSynthesis) return
+  try {
+    const utterance = new SpeechSynthesisUtterance(text)
+    utterance.lang = 'zh-CN'
+    utterance.rate = 1
+    utterance.pitch = 1
+    utterance.volume = 1
+    // 打断上一条，优先播报最新报警
+    window.speechSynthesis.cancel()
+    window.speechSynthesis.speak(utterance)
+  } catch (error) {
+    console.warn('语音播报失败:', error)
+  }
+}
+
+const runAlarmActions = (alarm) => {
+  pendingAlarmQueue.push(alarm)
+  processAlarmQueue()
+}
+
+const processAlarmQueue = async () => {
+  if (alarmActionRunning || pendingAlarmQueue.length === 0) return
+  alarmActionRunning = true
+
+  const alarm = pendingAlarmQueue.shift()
+  const popupEnabled = alarm?.popup_alarm_enabled !== false
+  const soundLightEnabled = alarm?.sound_light_alarm_enabled !== false
+  const alarmText = buildAlarmText(alarm)
+
+  try {
+    if (soundLightEnabled) {
+      triggerFlashRed(alarmText, !popupEnabled)
+      speakAlarm(alarmText)
+    }
+
+    if (popupEnabled) {
+      await ElMessageBox.alert(alarmText, '报警提示', {
+        confirmButtonText: '确认关闭报警',
+        type: 'warning',
+        closeOnClickModal: false,
+        closeOnPressEscape: false,
+        showClose: false,
+        customClass: 'alarm-confirm-dialog'
+      })
+      if (soundLightEnabled) {
+        closeFlashRed()
+      }
+    } else if (soundLightEnabled) {
+      await waitFlashConfirm()
+    }
+  } catch (error) {
+    console.warn('报警确认中断:', error)
+  } finally {
+    if (typeof window !== 'undefined' && window.speechSynthesis) {
+      window.speechSynthesis.cancel()
+    }
+    alarmActionRunning = false
+    processAlarmQueue()
   }
 }
 
@@ -638,6 +774,76 @@ const handleLogout = async () => {
   margin-bottom: 10px;
   padding-bottom: 10px;
   border-bottom: 1px solid #e4e7ed;
+}
+
+.alarm-flash-overlay {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  background: rgba(255, 0, 0, 0.2);
+  z-index: 9999;
+  animation: alarm-red-blink 0.8s ease-in-out infinite;
+}
+
+.flash-confirm-card {
+  min-width: 420px;
+  max-width: 70vw;
+  background: #ffffff;
+  border: 2px solid #f56c6c;
+  border-radius: 10px;
+  box-shadow: 0 8px 26px rgba(0, 0, 0, 0.3);
+  padding: 18px 22px;
+  text-align: center;
+  pointer-events: auto;
+}
+
+.flash-confirm-title {
+  font-size: 20px;
+  font-weight: 700;
+  color: #c45656;
+  margin-bottom: 8px;
+}
+
+.flash-confirm-text {
+  color: #333;
+  font-size: 16px;
+  line-height: 1.6;
+  margin-bottom: 16px;
+}
+
+@keyframes alarm-red-blink {
+  0% {
+    background: rgba(255, 0, 0, 0.18);
+  }
+  50% {
+    background: rgba(255, 0, 0, 0.55);
+  }
+  100% {
+    background: rgba(255, 0, 0, 0.18);
+  }
+}
+</style>
+
+<style>
+.alarm-confirm-dialog {
+  width: 560px !important;
+}
+
+.alarm-confirm-dialog .el-message-box__title {
+  font-size: 22px;
+}
+
+.alarm-confirm-dialog .el-message-box__message {
+  font-size: 18px;
+  line-height: 1.7;
+}
+
+.alarm-confirm-dialog .el-button {
+  min-width: 170px;
+  font-size: 16px;
 }
 </style>
 

@@ -484,6 +484,21 @@
               启用后，同一ID在整个生命周期内只报警一次
             </span>
           </el-form-item>
+
+          <el-divider>报警动作设置</el-divider>
+
+          <el-form-item label="弹窗报警">
+            <el-switch v-model="alarmForm.popup_alarm_enabled" />
+            <span style="margin-left: 10px; color: #666; font-size: 12px">
+              开启后将推送前端弹窗报警
+            </span>
+          </el-form-item>
+          <el-form-item label="声光报警">
+            <el-switch v-model="alarmForm.sound_light_alarm_enabled" />
+            <span style="margin-left: 10px; color: #666; font-size: 12px">
+              开启后执行声光报警动作（屏幕闪红并语音播报）
+            </span>
+          </el-form-item>
           
           <el-divider>事件保存设置</el-divider>
           
@@ -620,6 +635,8 @@ const alarmForm = ref({
   drowsy_eye_frames_threshold: 20,
   drowsy_yawn_frames_threshold: 12,
   once_per_id: false,
+  popup_alarm_enabled: true,
+  sound_light_alarm_enabled: true,
   save_event_video: true,
   save_event_image: true,
   event_video_duration: 10,
@@ -1005,6 +1022,12 @@ const loadAlarmConfig = async () => {
     }
     if (res.data.once_per_id !== undefined) {
       alarmForm.value.once_per_id = res.data.once_per_id
+    }
+    if (res.data.popup_alarm_enabled !== undefined) {
+      alarmForm.value.popup_alarm_enabled = res.data.popup_alarm_enabled
+    }
+    if (res.data.sound_light_alarm_enabled !== undefined) {
+      alarmForm.value.sound_light_alarm_enabled = res.data.sound_light_alarm_enabled
     }
     if (res.data.save_event_video !== undefined) {
       alarmForm.value.save_event_video = res.data.save_event_video
@@ -1437,6 +1460,8 @@ const applyAlarm = async () => {
   alarmLoading.value = true
   try {
     const payload = {
+      popup_alarm_enabled: alarmForm.value.popup_alarm_enabled,
+      sound_light_alarm_enabled: alarmForm.value.sound_light_alarm_enabled,
       save_event_video: alarmForm.value.save_event_video,
       save_event_image: alarmForm.value.save_event_image,
       event_video_duration: alarmForm.value.event_video_duration,
