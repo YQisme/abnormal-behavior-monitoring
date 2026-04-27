@@ -4439,10 +4439,11 @@ def export_alarm_events_docs():
             ])
         csv_text = output.getvalue()
         output.close()
+        csv_bytes = csv_text.encode('utf-8-sig')
 
         filename = f"alarm_events_documents{suffix}_{now_tag}.csv"
         return Response(
-            csv_text,
+            csv_bytes,
             mimetype='text/csv; charset=utf-8',
             headers={'Content-Disposition': f'attachment; filename="{filename}"'}
         )

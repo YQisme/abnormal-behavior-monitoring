@@ -31,6 +31,7 @@
           <el-radio-group v-model="viewMode" size="small">
             <el-radio-button label="timeline">时间线</el-radio-button>
             <el-radio-button label="grid">平铺</el-radio-button>
+            <el-radio-button label="document">文档视图</el-radio-button>
           </el-radio-group>
         </div>
         <div class="toolbar-row">
@@ -132,7 +133,7 @@
         </el-timeline>
       </div>
 
-      <div v-else class="grid-wrap" v-loading="loading">
+      <div v-else-if="viewMode === 'grid'" class="grid-wrap" v-loading="loading">
         <el-row :gutter="16">
           <el-col
             v-for="event in filteredEvents"
@@ -179,6 +180,19 @@
             </el-card>
           </el-col>
         </el-row>
+      </div>
+
+      <div v-else class="document-wrap" v-loading="loading">
+        <el-table :data="documentRows" border stripe>
+          <el-table-column prop="event_id" label="事件ID" min-width="200" show-overflow-tooltip />
+          <el-table-column prop="event_type_label" label="事件类型" width="110" />
+          <el-table-column prop="occurred_time" label="发生时间" width="180" />
+          <el-table-column prop="object_name" label="目标" min-width="120" show-overflow-tooltip />
+          <el-table-column prop="zone_name" label="区域" min-width="120" show-overflow-tooltip />
+          <el-table-column prop="track_id" label="跟踪ID" width="100" />
+          <el-table-column prop="description" label="说明" min-width="240" show-overflow-tooltip />
+          <el-table-column prop="total_size_text" label="占用大小" width="110" />
+        </el-table>
       </div>
     </el-card>
   </div>
@@ -234,6 +248,23 @@ const filteredEvents = computed(() => {
 })
 
 const totalEvents = computed(() => flatEvents.value.length)
+
+const documentRows = computed(() => {
+  return filteredEvents.value.map((event) => {
+    const doc = event.document || {}
+    const occurredAt = doc.occurred_at || event.occurred_at
+    return {
+      event_id: doc.event_id || event.event_id,
+      event_type_label: eventTypeLabel(doc.event_type || event.event_type),
+      occurred_time: formatTime(occurredAt),
+      object_name: doc.object_name || '-',
+      zone_name: doc.zone_name || '-',
+      track_id: doc.track_id || '-',
+      description: doc.description || '无',
+      total_size_text: formatBytes(event.total_size)
+    }
+  })
+})
 
 const formatTime = (timestamp) => {
   if (!timestamp) return '-'
@@ -487,6 +518,10 @@ onMounted(() => {
 }
 
 .grid-wrap {
+  margin-top: 10px;
+}
+
+.document-wrap {
   margin-top: 10px;
 }
 
