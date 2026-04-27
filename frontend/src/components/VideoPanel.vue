@@ -60,7 +60,7 @@ const processedVideoStreamUrl = computed(() => {
   const baseUrl = import.meta.env.DEV 
     ? (import.meta.env.VITE_API_URL || `http://${window.location.hostname}:5000`)
     : window.location.origin
-  return `${baseUrl}/api/video/processed_stream`
+  return `${baseUrl}${props.apiPrefix}/video/processed_stream`
 })
 
 const isDrawing = ref(false)

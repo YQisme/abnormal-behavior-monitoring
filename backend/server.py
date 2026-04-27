@@ -2055,7 +2055,7 @@ def detection_worker():
                 socketio.emit('frame', detection_data)
                 time.sleep(0.05)
                 continue
-            
+
             # 仅在“区域报警”档案下保留跨帧跟踪；其它档案用普通检测，避免长期累计跟踪状态
             try:
                 with model_lock:
@@ -2620,14 +2620,21 @@ def save_zones_config(profile=None):
         backend_logger.error(f"保存区域配置失败: {e}")
 
 
-def ensure_detection_profile(profile):
+def ensure_detection_profile(profile, force=False):
     """切换并加载指定检测档案配置"""
     global current_detection_profile, alarm_triggered, zone_has_people_mqtt_sent, offpost_last_seen_person_ts, offpost_absence_alarm_sent, offpost_recovery_candidate_ts, drowsy_eye_low_frames, drowsy_yawn_high_frames, drowsy_last_state, drowsy_last_alarm_state
 
     if profile not in DETECTION_PROFILE_FILES:
         raise ValueError("未知检测档案")
+
+    # 运行中禁止页面请求触发档案切换，避免视频源/配置被频繁打断。
+    # 仅允许推理控制接口（start）通过 force=True 主动切换。
+    with inference_state_lock:
+        if inference_running and not force and profile != current_detection_profile:
+            backend_logger.info(f"推理运行中，忽略档案切换请求: {current_detection_profile} -> {profile}")
+            return False
     if current_detection_profile == profile:
-        return
+        return False
 
     current_detection_profile = profile
     apply_model_profile(profile)
@@ -2650,6 +2657,7 @@ def ensure_detection_profile(profile):
         backend_logger.info(
             f"当前使用 task 模型: {get_drowsy_task_model_name()} ({get_drowsy_task_model_path()})"
         )
+    return True
 
 
 def get_profile_from_request_path(path):
@@ -3067,11 +3075,14 @@ def start_inference_api():
     global inference_running, inference_running_profiles
     profile = get_profile_from_request_path(request.path)
     try:
+        already_running = False
         with inference_state_lock:
             already_running = bool(inference_running_profiles.get(profile, False))
-            if already_running:
-                return jsonify({"success": True, "message": "当前模式推理已在运行", "profile": profile})
-        ensure_detection_profile(profile)
+        if already_running:
+            # 即使该模式已标记为运行，也要切换到对应档案，确保模型与视频源同步到目标模式
+            ensure_detection_profile(profile, force=True)
+            return jsonify({"success": True, "message": "当前模式推理已在运行，已切换到该模式", "profile": profile})
+        ensure_detection_profile(profile, force=True)
         if model is None:
             load_model()
         with inference_state_lock:
@@ -3283,13 +3294,21 @@ def set_model():
 def get_video():
     """获取当前视频URL和摄像头状态"""
     profile = get_profile_from_request_path(request.path)
-    ensure_detection_profile(profile)
-    with video_lock:
-        video_url = video_path
-    with camera_status_lock:
-        status = camera_status
-        ip = camera_ip
-        interval = camera_check_interval
+    with inference_state_lock:
+        profile_is_active = (profile == current_detection_profile)
+    if profile_is_active:
+        with video_lock:
+            video_url = video_path
+        with camera_status_lock:
+            status = camera_status
+            ip = camera_ip
+            interval = camera_check_interval
+    else:
+        profile_cfg = video_profile_config.get(profile, video_profile_config.get(DETECTION_PROFILE_ZONE, {}))
+        video_url = profile_cfg.get("video_url", "")
+        ip = profile_cfg.get("camera_ip", "")
+        interval = int(profile_cfg.get("camera_check_interval", 5))
+        status = "unknown"
     
     return jsonify({
         "video_url": video_url,
@@ -3336,7 +3355,6 @@ def set_video():
     """设置视频URL、摄像头IP和检测间隔"""
     global video_path, camera_ip, camera_check_interval, camera_status, camera_last_status
     profile = get_profile_from_request_path(request.path)
-    ensure_detection_profile(profile)
     
     data = request.get_json(silent=True) or {}
     new_video_url = data.get('video_url')
@@ -3347,54 +3365,51 @@ def set_video():
         return jsonify({"success": False, "message": "未指定视频URL"}), 400
     
     try:
-        with video_lock:
-            video_path = new_video_url
-        
-        # 使用锁保护IP和间隔的修改，避免与检测线程冲突
-        with camera_status_lock:
-            # 处理摄像头IP：如果请求中明确提供了camera_ip字段，使用提供的值（即使是空字符串）
-            # 否则从RTSP URL中提取
-            if 'camera_ip' in data:
-                # 明确提供了IP字段，使用提供的值（允许为空字符串）
-                camera_ip = new_camera_ip.strip() if new_camera_ip else ""
-            else:
-                # 没有提供IP字段，从RTSP URL中提取
-                extracted_ip = extract_ip_from_rtsp(new_video_url)
-                if extracted_ip:
-                    camera_ip = extracted_ip
-                else:
-                    camera_ip = ""
-            
-            # 更新检测间隔
-            if new_check_interval is not None:
-                interval = int(new_check_interval)
-                if interval < 1:
-                    interval = 1  # 最小1秒
-                camera_check_interval = interval
+        if 'camera_ip' in data:
+            target_camera_ip = new_camera_ip.strip() if new_camera_ip else ""
+        else:
+            extracted_ip = extract_ip_from_rtsp(new_video_url)
+            target_camera_ip = extracted_ip if extracted_ip else ""
+
+        target_interval = camera_check_interval
+        if new_check_interval is not None:
+            target_interval = int(new_check_interval)
+            if target_interval < 1:
+                target_interval = 1  # 最小1秒
 
         if profile not in video_profile_config:
             video_profile_config[profile] = {}
-        video_profile_config[profile]["video_url"] = video_path
-        video_profile_config[profile]["camera_ip"] = camera_ip
-        video_profile_config[profile]["camera_check_interval"] = camera_check_interval
+        video_profile_config[profile]["video_url"] = new_video_url
+        video_profile_config[profile]["camera_ip"] = target_camera_ip
+        video_profile_config[profile]["camera_check_interval"] = target_interval
+
+        with inference_state_lock:
+            profile_is_active = (profile == current_detection_profile)
+
+        if profile_is_active:
+            with video_lock:
+                video_path = new_video_url
+            with camera_status_lock:
+                camera_ip = target_camera_ip
+                camera_check_interval = target_interval
         save_video_profile_config()
         
         save_system_config()
         
         # 立即检测一次状态（在锁外执行ping，避免阻塞）
-        if camera_ip:
-            is_online = ping_ip(camera_ip, timeout=2)
+        if profile_is_active and target_camera_ip:
+            is_online = ping_ip(target_camera_ip, timeout=2)
             with camera_status_lock:
                 camera_status = "online" if is_online else "offline"
                 camera_last_status = camera_status
         
         return jsonify({
             "success": True,
-            "message": "视频配置已更新",
-            "video_url": video_path,
-            "camera_ip": camera_ip,
+            "message": "视频配置已更新" if profile_is_active else "视频配置已保存（当前未生效，切换并启动该模式后生效）",
+            "video_url": new_video_url,
+            "camera_ip": target_camera_ip,
             "camera_status": camera_status,
-            "camera_check_interval": camera_check_interval
+            "camera_check_interval": target_interval
         })
     except Exception as e:
         return jsonify({"success": False, "message": f"设置视频配置失败: {str(e)}"}), 500
@@ -3909,8 +3924,12 @@ def video_stream():
 
 
 @app.route('/api/video/processed_stream')
+@app.route('/api/offpost/video/processed_stream')
+@app.route('/api/drowsy/video/processed_stream')
 def processed_video_stream():
     """经过YOLO处理的视频流（MJPEG格式，包含检测框和区域）"""
+    profile = get_profile_from_request_path(request.path)
+    ensure_detection_profile(profile, force=True)
     return Response(
         generate_processed_video_stream(),
         mimetype='multipart/x-mixed-replace; boundary=frame'
