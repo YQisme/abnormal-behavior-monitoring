@@ -925,12 +925,16 @@ def load_alarm_config(profile=None):
         except Exception as e:
             backend_logger.error(f"加载报警配置文件失败: {e}")
     
-    # 确保事件保存路径存在
+    # 确保事件保存路径存在（按事件类型分目录，避免根目录出现空 videos/images）
     if alarm_config.get('save_event_video') or alarm_config.get('save_event_image'):
         event_path = alarm_config.get('event_save_path', os.path.join(BASE_DIR, "alarm_events"))
         os.makedirs(event_path, exist_ok=True)
-        os.makedirs(os.path.join(event_path, "videos"), exist_ok=True)
-        os.makedirs(os.path.join(event_path, "images"), exist_ok=True)
+        for event_type_dir in ("zone", "offpost", "drowsy"):
+            os.makedirs(os.path.join(event_path, event_type_dir), exist_ok=True)
+            if alarm_config.get('save_event_video'):
+                os.makedirs(os.path.join(event_path, event_type_dir, "videos"), exist_ok=True)
+            if alarm_config.get('save_event_image'):
+                os.makedirs(os.path.join(event_path, event_type_dir, "images"), exist_ok=True)
 
 def save_alarm_config(profile=None):
     """保存报警配置到文件"""
@@ -1202,14 +1206,24 @@ def _box_has_valid_data(box):
     return True
 
 
-def save_alarm_event_video(track_id, zone_id, zone_name, class_id, class_name_cn, bbox_center):
+def _resolve_event_type_dir(event_type):
+    """将事件类型映射到固定目录名，保证不同类型事件分目录保存。"""
+    if event_type == "offpost_absence":
+        return "offpost"
+    if event_type == "drowsy":
+        return "drowsy"
+    return "zone"
+
+
+def save_alarm_event_video(track_id, zone_id, zone_name, class_id, class_name_cn, bbox_center, event_type="zone"):
     """保存报警事件视频（基于当前帧缓冲录制，兼容 RTSP/本地摄像头）"""
     try:
         if not alarm_config.get('save_event_video', True):
             return None
         
         event_path = alarm_config.get('event_save_path', os.path.join(BASE_DIR, "alarm_events"))
-        video_dir = os.path.join(event_path, "videos")
+        event_type_dir = _resolve_event_type_dir(event_type)
+        video_dir = os.path.join(event_path, event_type_dir, "videos")
         os.makedirs(video_dir, exist_ok=True)
         
         duration = alarm_config.get('event_video_duration', 10)
@@ -1307,7 +1321,7 @@ def save_alarm_event_video(track_id, zone_id, zone_name, class_id, class_name_cn
         return None
 
 
-def save_alarm_event_image(track_id, zone_id, zone_name, class_id, class_name_cn, bbox_center):
+def save_alarm_event_image(track_id, zone_id, zone_name, class_id, class_name_cn, bbox_center, event_type="zone"):
     """保存报警事件图片"""
     try:
         if not alarm_config.get('save_event_image', True):
@@ -1317,7 +1331,8 @@ def save_alarm_event_image(track_id, zone_id, zone_name, class_id, class_name_cn
             return None
         
         event_path = alarm_config.get('event_save_path', os.path.join(BASE_DIR, "alarm_events"))
-        image_dir = os.path.join(event_path, "images")
+        event_type_dir = _resolve_event_type_dir(event_type)
+        image_dir = os.path.join(event_path, event_type_dir, "images")
         os.makedirs(image_dir, exist_ok=True)
         
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1524,9 +1539,13 @@ def trigger_alarm(track_id, bbox_center, zone_id, zone_name, class_id=None, clas
     event_video_filename = None
     event_image_filename = None
     if alarm_config.get('save_event_video', True):
-        event_video_filename = save_alarm_event_video(track_id, zone_id, zone_name, class_id, class_name_cn, bbox_center)
+        event_video_filename = save_alarm_event_video(
+            track_id, zone_id, zone_name, class_id, class_name_cn, bbox_center, event_type="zone"
+        )
     if alarm_config.get('save_event_image', True):
-        event_image_filename = save_alarm_event_image(track_id, zone_id, zone_name, class_id, class_name_cn, bbox_center)
+        event_image_filename = save_alarm_event_image(
+            track_id, zone_id, zone_name, class_id, class_name_cn, bbox_center, event_type="zone"
+        )
     
     alarm_data = {
         "time": current_time,
@@ -1560,17 +1579,33 @@ def trigger_offpost_absence_alarm(absence_duration, zone_name='当前区域'):
         return False
 
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # 与其他报警类型保持一致：按配置保存事件视频/图片
+    event_video_filename = None
+    event_image_filename = None
+    offpost_track_id = -1
+    offpost_zone_id = "offpost"
+    offpost_center = [0.0, 0.0]
+    offpost_title = "人员离岗"
+    if alarm_config.get('save_event_video', True):
+        event_video_filename = save_alarm_event_video(
+            offpost_track_id, offpost_zone_id, zone_name, None, offpost_title, offpost_center, event_type="offpost_absence"
+        )
+    if alarm_config.get('save_event_image', True):
+        event_image_filename = save_alarm_event_image(
+            offpost_track_id, offpost_zone_id, zone_name, None, offpost_title, offpost_center, event_type="offpost_absence"
+        )
+
     alarm_data = {
         "time": current_time,
-        "track_id": -1,
+        "track_id": offpost_track_id,
         "class_id": None,
-        "class_name_cn": "人员离岗",
-        "object_name": "人员离岗",
-        "zone_id": "offpost",
+        "class_name_cn": offpost_title,
+        "object_name": offpost_title,
+        "zone_id": offpost_zone_id,
         "zone_name": zone_name,
-        "position": {"x": 0.0, "y": 0.0},
-        "event_video": None,
-        "event_image": None,
+        "position": {"x": offpost_center[0], "y": offpost_center[1]},
+        "event_video": event_video_filename,
+        "event_image": event_image_filename,
         "absence_duration": round(float(absence_duration), 2),
         "alarm_type": "offpost_absence"
     }
@@ -1692,11 +1727,11 @@ def trigger_drowsy_alarm(state, ear_value, mar_value, zone_name="当前区域"):
     drowsy_center = [0.0, 0.0]
     if alarm_config.get('save_event_video', True):
         event_video_filename = save_alarm_event_video(
-            drowsy_track_id, drowsy_zone_id, zone_name, None, title, drowsy_center
+            drowsy_track_id, drowsy_zone_id, zone_name, None, title, drowsy_center, event_type="drowsy"
         )
     if alarm_config.get('save_event_image', True):
         event_image_filename = save_alarm_event_image(
-            drowsy_track_id, drowsy_zone_id, zone_name, None, title, drowsy_center
+            drowsy_track_id, drowsy_zone_id, zone_name, None, title, drowsy_center, event_type="drowsy"
         )
 
     alarm_data = {
@@ -1802,6 +1837,7 @@ def video_reader():
         打开视频源：
         - 本地摄像头索引优先使用 V4L2（Jetson/Linux 更稳定）
         - 失败时回退到 OpenCV 默认后端
+        - RTSP流优先使用FFmpeg，并启用抗损坏参数
         """
         source = get_capture_source(path)
         if isinstance(source, int):
@@ -1811,6 +1847,22 @@ def video_reader():
                 return cap_v4l2
             cap_v4l2.release()
             backend_logger.warning(f"V4L2打开本地摄像头失败，回退默认后端: /dev/video{source}")
+            return cv2.VideoCapture(source)
+
+        if isinstance(source, str) and source.lower().startswith(("rtsp://", "rtsps://")):
+            # 使用 OpenCV FFmpeg 捕获参数增强 RTSP 抗抖动能力：
+            # 1) 强制TCP，减少丢包；
+            # 2) discardcorrupt：遇到损坏包时尽量跳过而非卡住；
+            # 3) 降低FFmpeg日志级别，避免大量解码告警刷屏。
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;discardcorrupt"
+            os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "16"  # error
+            cap_ffmpeg = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+            if cap_ffmpeg.isOpened():
+                backend_logger.info("使用FFmpeg后端打开RTSP流成功（已启用discardcorrupt）")
+                return cap_ffmpeg
+            cap_ffmpeg.release()
+            backend_logger.warning("FFmpeg后端打开RTSP失败，回退OpenCV默认后端")
+
         return cv2.VideoCapture(source)
     
     while not stop_flag.is_set():
