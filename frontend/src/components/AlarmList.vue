@@ -51,6 +51,19 @@
               ，已触发离岗报警
             </span>
           </template>
+
+          <!-- 瞌睡报警格式 -->
+          <template v-else-if="alarm.alarm_type === 'drowsy'">
+            <span class="alarm-icon">😴</span>
+            <span class="alarm-title">{{ alarm.object_name || '瞌睡预警' }}</span>
+            <span class="alarm-detail" v-if="alarm.zone_name"> - 区域: 【{{ alarm.zone_name }}】</span>
+            <br>
+            <span class="alarm-desc">
+              状态: {{ alarm.drowsy_state || '未知' }}
+              <span v-if="alarm.ear !== undefined"> | EAR: {{ Number(alarm.ear).toFixed(3) }}</span>
+              <span v-if="alarm.mar !== undefined"> | MAR: {{ Number(alarm.mar).toFixed(3) }}</span>
+            </span>
+          </template>
         </div>
       </div>
     </el-scrollbar>
@@ -74,6 +87,8 @@ const getAlarmTypeClass = (alarmType) => {
       return 'alarm-occlusion'
     case 'offpost_absence':
       return 'alarm-offpost'
+    case 'drowsy':
+      return 'alarm-drowsy'
     case 'zone':
     default:
       return 'alarm-zone'
@@ -116,6 +131,12 @@ const getAlarmTypeClass = (alarmType) => {
 .alarm-offpost {
   border-left: 4px solid #7c3aed;
   background: #f5f3ff;
+}
+
+/* 瞌睡报警 - 深红 */
+.alarm-drowsy {
+  border-left: 4px solid #c0392b;
+  background: #fdf2f2;
 }
 
 @keyframes slideIn {
@@ -181,6 +202,10 @@ const getAlarmTypeClass = (alarmType) => {
 
 .alarm-offpost .alarm-title {
   color: #7c3aed;
+}
+
+.alarm-drowsy .alarm-title {
+  color: #c0392b;
 }
 
 .alarm-detail {

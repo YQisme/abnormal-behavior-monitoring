@@ -4,7 +4,7 @@
       <!-- 模型配置 -->
       <el-tab-pane v-if="isTabVisible('model')" label="模型配置" name="model">
         <el-form :model="modelForm" label-width="120px">
-          <el-form-item label="检测模型">
+          <el-form-item :label="isDrowsyMode ? '人脸关键点模型' : '检测模型'">
             <el-select v-model="modelForm.model" placeholder="加载中..." style="width: 100%">
               <el-option
                 v-for="model in models"
@@ -13,8 +13,11 @@
                 :value="model.name"
               />
             </el-select>
+            <span v-if="isDrowsyMode" style="margin-left: 10px; color: #666; font-size: 12px">
+              瞌睡模式仅支持 MediaPipe `.task` 模型
+            </span>
           </el-form-item>
-          <el-form-item label="推理尺寸 (imgsz)">
+          <el-form-item v-if="!isDrowsyMode" label="推理尺寸 (imgsz)">
             <el-input-number
               v-model="modelForm.imgsz"
               :min="32"
@@ -393,7 +396,7 @@
       <!-- 报警配置 -->
       <el-tab-pane v-if="isTabVisible('alarm')" label="报警设置" name="alarm">
         <el-form :model="alarmForm" label-width="150px">
-          <el-form-item label="防抖时间（秒）">
+          <el-form-item v-if="!isDrowsyMode && !isOffpostMode" label="防抖时间（秒）">
             <el-input-number
               v-model="alarmForm.debounce_time"
               :min="0"
@@ -417,7 +420,53 @@
               离岗监测中，连续未检测到人达到该时长后触发报警
             </span>
           </el-form-item>
-          <el-form-item label="检测模式">
+          <el-form-item v-if="isDrowsyMode" label="EAR 阈值">
+            <el-input-number
+              v-model="alarmForm.drowsy_ear_threshold"
+              :min="0.05"
+              :max="1"
+              :step="0.01"
+              :precision="2"
+            />
+            <span style="margin-left: 10px; color: #666; font-size: 12px">
+              眼睛纵横比低于该阈值时认为闭眼趋势（默认 0.20）
+            </span>
+          </el-form-item>
+          <el-form-item v-if="isDrowsyMode" label="MAR 阈值">
+            <el-input-number
+              v-model="alarmForm.drowsy_mar_threshold"
+              :min="0.05"
+              :max="2"
+              :step="0.01"
+              :precision="2"
+            />
+            <span style="margin-left: 10px; color: #666; font-size: 12px">
+              嘴部纵横比高于该阈值时认为打哈欠趋势（默认 0.60）
+            </span>
+          </el-form-item>
+          <el-form-item v-if="isDrowsyMode" label="闭眼连续帧阈值">
+            <el-input-number
+              v-model="alarmForm.drowsy_eye_frames_threshold"
+              :min="1"
+              :max="300"
+              :step="1"
+            />
+            <span style="margin-left: 10px; color: #666; font-size: 12px">
+              EAR 持续低于阈值达到该帧数后判定瞌睡（默认 20）
+            </span>
+          </el-form-item>
+          <el-form-item v-if="isDrowsyMode" label="打哈欠连续帧阈值">
+            <el-input-number
+              v-model="alarmForm.drowsy_yawn_frames_threshold"
+              :min="1"
+              :max="300"
+              :step="1"
+            />
+            <span style="margin-left: 10px; color: #666; font-size: 12px">
+              MAR 持续高于阈值达到该帧数后判定打哈欠（默认 12）
+            </span>
+          </el-form-item>
+          <el-form-item v-if="!isDrowsyMode" label="检测模式">
             <el-select v-model="alarmForm.detection_mode" style="width: 100%">
               <el-option
                 label="中心点模式（检测框中心点进入区域）"
@@ -429,7 +478,7 @@
               />
             </el-select>
           </el-form-item>
-          <el-form-item label="相同ID只报警一次">
+          <el-form-item v-if="!isDrowsyMode && !isOffpostMode" label="相同ID只报警一次">
             <el-switch v-model="alarmForm.once_per_id" />
             <span style="margin-left: 10px; color: #666; font-size: 12px">
               启用后，同一ID在整个生命周期内只报警一次
@@ -524,6 +573,7 @@ const emit = defineEmits(['model-changed', 'video-changed', 'classes-changed', '
 const activeTab = ref('model')
 const isTabVisible = (tabName) => props.visibleTabs.includes(tabName)
 const isOffpostMode = computed(() => props.alarmApiPrefix === '/api/offpost')
+const isDrowsyMode = computed(() => props.alarmApiPrefix === '/api/drowsy')
 
 const resolveActiveTab = (preferredTab) => {
   if (isTabVisible(preferredTab)) {
@@ -565,6 +615,10 @@ const alarmForm = ref({
   debounce_time: 5.0,
   offpost_absence_duration: 10.0,
   detection_mode: 'center',
+  drowsy_ear_threshold: 0.20,
+  drowsy_mar_threshold: 0.60,
+  drowsy_eye_frames_threshold: 20,
+  drowsy_yawn_frames_threshold: 12,
   once_per_id: false,
   save_event_video: true,
   save_event_image: true,
@@ -937,6 +991,18 @@ const loadAlarmConfig = async () => {
     if (res.data.detection_mode !== undefined) {
       alarmForm.value.detection_mode = res.data.detection_mode
     }
+    if (res.data.drowsy_ear_threshold !== undefined) {
+      alarmForm.value.drowsy_ear_threshold = Number(res.data.drowsy_ear_threshold)
+    }
+    if (res.data.drowsy_mar_threshold !== undefined) {
+      alarmForm.value.drowsy_mar_threshold = Number(res.data.drowsy_mar_threshold)
+    }
+    if (res.data.drowsy_eye_frames_threshold !== undefined) {
+      alarmForm.value.drowsy_eye_frames_threshold = Number(res.data.drowsy_eye_frames_threshold)
+    }
+    if (res.data.drowsy_yawn_frames_threshold !== undefined) {
+      alarmForm.value.drowsy_yawn_frames_threshold = Number(res.data.drowsy_yawn_frames_threshold)
+    }
     if (res.data.once_per_id !== undefined) {
       alarmForm.value.once_per_id = res.data.once_per_id
     }
@@ -1134,10 +1200,13 @@ const applyModel = async () => {
   
   try {
     modelLoading.value = true
-    const res = await axios.post(`${props.alarmApiPrefix}/model`, {
-      model: modelForm.value.model,
-      imgsz: modelForm.value.imgsz
-    })
+    const payload = {
+      model: modelForm.value.model
+    }
+    if (!isDrowsyMode.value) {
+      payload.imgsz = modelForm.value.imgsz
+    }
+    const res = await axios.post(`${props.alarmApiPrefix}/model`, payload)
     if (res.data.success) {
       ElMessage.success(res.data.message)
       emit('model-changed')
@@ -1367,16 +1436,28 @@ const selectEventSavePath = async () => {
 const applyAlarm = async () => {
   alarmLoading.value = true
   try {
-    const res = await axios.post(`${props.alarmApiPrefix}/alarm`, {
-      debounce_time: alarmForm.value.debounce_time,
-      offpost_absence_duration: alarmForm.value.offpost_absence_duration,
-      detection_mode: alarmForm.value.detection_mode,
-      once_per_id: alarmForm.value.once_per_id,
+    const payload = {
       save_event_video: alarmForm.value.save_event_video,
       save_event_image: alarmForm.value.save_event_image,
       event_video_duration: alarmForm.value.event_video_duration,
       event_save_path: alarmForm.value.event_save_path
-    })
+    }
+    if (isOffpostMode.value) {
+      payload.offpost_absence_duration = alarmForm.value.offpost_absence_duration
+    }
+    if (isDrowsyMode.value) {
+      payload.drowsy_ear_threshold = alarmForm.value.drowsy_ear_threshold
+      payload.drowsy_mar_threshold = alarmForm.value.drowsy_mar_threshold
+      payload.drowsy_eye_frames_threshold = alarmForm.value.drowsy_eye_frames_threshold
+      payload.drowsy_yawn_frames_threshold = alarmForm.value.drowsy_yawn_frames_threshold
+    } else if (isOffpostMode.value) {
+      payload.detection_mode = alarmForm.value.detection_mode
+    } else {
+      payload.debounce_time = alarmForm.value.debounce_time
+      payload.detection_mode = alarmForm.value.detection_mode
+      payload.once_per_id = alarmForm.value.once_per_id
+    }
+    const res = await axios.post(`${props.alarmApiPrefix}/alarm`, payload)
     if (res.data.success) {
       ElMessage.success(res.data.message)
       emit('alarm-changed')

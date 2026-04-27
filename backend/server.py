@@ -10,6 +10,7 @@ import json
 import os
 import glob
 import base64
+import math
 import numpy as np
 from datetime import datetime
 from ultralytics import YOLO
@@ -18,12 +19,20 @@ import subprocess
 import signal
 import re
 import socket
+from collections import deque
 try:
     import paho.mqtt.client as mqtt
     MQTT_AVAILABLE = True
 except ImportError:
     MQTT_AVAILABLE = False
     backend_logger.warning("MQTT库未安装，MQTT功能将不可用。请运行: pip install paho-mqtt")
+
+try:
+    import mediapipe as mp
+    MEDIAPIPE_AVAILABLE = True
+except ImportError:
+    mp = None
+    MEDIAPIPE_AVAILABLE = False
 
 # 获取项目根目录路径（backend/ 的父目录）
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -194,6 +203,26 @@ inference_running_profiles = {
     DETECTION_PROFILE_OFFPOST: False,
     DETECTION_PROFILE_DROWSY: False
 }
+
+# 瞌睡检测（EAR/MAR）配置与状态
+DROWSY_DEFAULT_TASK_MODEL = "face_landmarker.task"
+LEFT_EYE_LANDMARKS = [33, 160, 158, 133, 153, 144]
+RIGHT_EYE_LANDMARKS = [362, 385, 387, 263, 373, 380]
+UPPER_LIP_LANDMARK = 13
+LOWER_LIP_LANDMARK = 14
+MOUTH_LEFT_LANDMARK = 78
+MOUTH_RIGHT_LANDMARK = 308
+drowsy_detector = None
+drowsy_detector_backend = None
+drowsy_detector_ready = False
+drowsy_detector_error_logged = False
+drowsy_ear_hist = deque(maxlen=5)
+drowsy_mar_hist = deque(maxlen=5)
+drowsy_eye_low_frames = 0
+drowsy_yawn_high_frames = 0
+drowsy_last_alarm_time = 0.0
+drowsy_last_state = "Normal"
+drowsy_last_alarm_state = None
 model_profile_config_file = os.path.join(CONFIG_DIR, "model_profile_config.json")
 model_profile_config = {
     DETECTION_PROFILE_ZONE: {
@@ -206,7 +235,8 @@ model_profile_config = {
     },
     DETECTION_PROFILE_DROWSY: {
         "model": "yolo26m_640_int8.engine",
-        "imgsz": 640
+        "imgsz": 640,
+        "task_model": DROWSY_DEFAULT_TASK_MODEL
     }
 }
 video_profile_config_file = os.path.join(CONFIG_DIR, "video_profile_config.json")
@@ -517,10 +547,16 @@ def load_model_profile_config():
             cfg = json.load(f)
         for profile in [DETECTION_PROFILE_ZONE, DETECTION_PROFILE_OFFPOST, DETECTION_PROFILE_DROWSY]:
             profile_cfg = cfg.get(profile, {})
-            model_profile_config[profile] = {
+            merged_cfg = {
                 "model": profile_cfg.get("model", model_profile_config[profile]["model"]),
                 "imgsz": int(profile_cfg.get("imgsz", model_profile_config[profile]["imgsz"]))
             }
+            if profile == DETECTION_PROFILE_DROWSY:
+                merged_cfg["task_model"] = profile_cfg.get(
+                    "task_model",
+                    model_profile_config[profile].get("task_model", DROWSY_DEFAULT_TASK_MODEL)
+                )
+            model_profile_config[profile] = merged_cfg
         backend_logger.info(f"已从 {model_profile_config_file} 加载模型档案配置")
     except Exception as e:
         backend_logger.error(f"加载模型档案配置失败: {e}")
@@ -544,6 +580,11 @@ def apply_model_profile(profile):
     imgsz_val = int(profile_cfg.get("imgsz", yolo_imgsz))
     if imgsz_val < 32 or imgsz_val > 2048:
         imgsz_val = 640
+    # 瞌睡档案仅使用 .task 人脸关键点模型，不切换 YOLO 权重
+    if profile == DETECTION_PROFILE_DROWSY:
+        yolo_imgsz = imgsz_val
+        return
+
     model_changed = model_name != current_model_name
     current_model_name = model_name
     yolo_imgsz = imgsz_val
@@ -595,6 +636,38 @@ def apply_video_profile(profile):
             interval = camera_check_interval
         camera_check_interval = max(1, interval)
 
+
+def get_model_directory(profile=None):
+    """根据检测档案返回模型目录"""
+    return MODELS_DIR
+
+
+def list_profile_models(profile=None):
+    """列出指定档案可用的YOLO模型文件"""
+    model_dir = get_model_directory(profile)
+    if not os.path.exists(model_dir):
+        return []
+    models = []
+    for filename in os.listdir(model_dir):
+        if filename.endswith(('.engine', '.pt', '.onnx')):
+            models.append(filename)
+    models.sort()
+    return models
+
+
+def get_drowsy_task_model_name():
+    """获取瞌睡档案当前 task 模型文件名"""
+    profile_cfg = model_profile_config.get(DETECTION_PROFILE_DROWSY, {})
+    task_model = profile_cfg.get("task_model", DROWSY_DEFAULT_TASK_MODEL)
+    if not isinstance(task_model, str) or not task_model.strip():
+        task_model = DROWSY_DEFAULT_TASK_MODEL
+    return task_model
+
+
+def get_drowsy_task_model_path():
+    """获取瞌睡档案当前 task 模型完整路径"""
+    return os.path.join(MODELS_DIR, "sleep", get_drowsy_task_model_name())
+
 def load_model_classes(model_name):
     """加载模型对应的类别配置"""
     global model_classes, model_classes_cn
@@ -645,11 +718,30 @@ def load_model():
     # 重新检测GPU（可能在运行时发生变化）
     gpu_available, device = check_gpu_available()
     
-    model_path = os.path.join(MODELS_DIR, current_model_name)
-    if not os.path.exists(model_path):
-        backend_logger.warning(f"模型文件 {model_path} 不存在，使用默认模型")
+    # .task 属于 MediaPipe 模型，不能用于 YOLO；瞌睡档案下若误入该值，自动切回 YOLO 默认模型
+    if str(current_model_name).endswith('.task'):
         current_model_name = "yolo26m_640_int8.engine"
-        model_path = os.path.join(MODELS_DIR, current_model_name)
+
+    model_dir = get_model_directory(current_detection_profile)
+    model_path = os.path.join(model_dir, current_model_name)
+    if not os.path.exists(model_path):
+        available_models = list_profile_models(current_detection_profile)
+        if available_models:
+            current_model_name = available_models[0]
+            model_path = os.path.join(model_dir, current_model_name)
+            backend_logger.warning(f"模型文件不存在，已切换为当前档案可用模型: {current_model_name}")
+        else:
+            # 兜底：若当前档案目录无YOLO模型，回退到根目录默认模型，避免推理流程中断
+            fallback_model = "yolo26m_640_int8.engine"
+            fallback_path = os.path.join(MODELS_DIR, fallback_model)
+            if not os.path.exists(fallback_path):
+                raise FileNotFoundError(f"未找到可用模型，档案目录: {model_dir}")
+            current_model_name = fallback_model
+            model_path = fallback_path
+            if current_detection_profile == DETECTION_PROFILE_DROWSY:
+                backend_logger.info(f"瞌睡档案未配置YOLO模型，使用默认人员检测模型: {current_model_name}")
+            else:
+                backend_logger.warning(f"档案目录无可用模型，回退到默认模型: {current_model_name}")
     
     try:
         with model_lock:
@@ -789,7 +881,11 @@ def load_alarm_config(profile=None):
         "save_event_video": True,
         "save_event_image": True,
         "event_video_duration": 10,
-        "event_save_path": os.path.join(BASE_DIR, "alarm_events")
+        "event_save_path": os.path.join(BASE_DIR, "alarm_events"),
+        "drowsy_ear_threshold": 0.20,
+        "drowsy_mar_threshold": 0.60,
+        "drowsy_eye_frames_threshold": 20,
+        "drowsy_yawn_frames_threshold": 12
     }
 
     if os.path.exists(alarm_file):
@@ -812,6 +908,14 @@ def load_alarm_config(profile=None):
                     alarm_config['event_video_duration'] = int(config['event_video_duration'])
                 if 'event_save_path' in config:
                     alarm_config['event_save_path'] = config['event_save_path']
+                if 'drowsy_ear_threshold' in config:
+                    alarm_config['drowsy_ear_threshold'] = float(config['drowsy_ear_threshold'])
+                if 'drowsy_mar_threshold' in config:
+                    alarm_config['drowsy_mar_threshold'] = float(config['drowsy_mar_threshold'])
+                if 'drowsy_eye_frames_threshold' in config:
+                    alarm_config['drowsy_eye_frames_threshold'] = max(1, int(config['drowsy_eye_frames_threshold']))
+                if 'drowsy_yawn_frames_threshold' in config:
+                    alarm_config['drowsy_yawn_frames_threshold'] = max(1, int(config['drowsy_yawn_frames_threshold']))
                 backend_logger.info(f"已从 {alarm_file} 加载报警配置")
         except Exception as e:
             backend_logger.error(f"加载报警配置文件失败: {e}")
@@ -1502,6 +1606,186 @@ def trigger_offpost_absence_alarm(absence_duration, zone_name='当前区域'):
     return True
 
 
+def drowsy_dist(p1, p2):
+    """计算二维点距离"""
+    return math.hypot(float(p1[0]) - float(p2[0]), float(p1[1]) - float(p2[1]))
+
+
+def calc_ear(landmarks, idxs):
+    """计算眼睛纵横比 EAR（归一化坐标）"""
+    p1 = landmarks[idxs[0]]
+    p2 = landmarks[idxs[1]]
+    p3 = landmarks[idxs[2]]
+    p4 = landmarks[idxs[3]]
+    p5 = landmarks[idxs[4]]
+    p6 = landmarks[idxs[5]]
+    return (drowsy_dist((p2.x, p2.y), (p6.x, p6.y)) + drowsy_dist((p3.x, p3.y), (p5.x, p5.y))) / (2.0 * drowsy_dist((p1.x, p1.y), (p4.x, p4.y)) + 1e-6)
+
+
+def calc_mar(landmarks):
+    """计算嘴部纵横比 MAR（归一化坐标）"""
+    up = landmarks[UPPER_LIP_LANDMARK]
+    low = landmarks[LOWER_LIP_LANDMARK]
+    left = landmarks[MOUTH_LEFT_LANDMARK]
+    right = landmarks[MOUTH_RIGHT_LANDMARK]
+    return drowsy_dist((up.x, up.y), (low.x, low.y)) / (drowsy_dist((left.x, left.y), (right.x, right.y)) + 1e-6)
+
+
+def create_drowsy_face_detector():
+    """创建瞌睡检测人脸关键点检测器（仅使用 tasks + .task 模型）"""
+    if not MEDIAPIPE_AVAILABLE:
+        raise RuntimeError("未安装 mediapipe，无法启用瞌睡检测")
+
+    if not hasattr(mp, "tasks"):
+        raise RuntimeError("当前 mediapipe 不支持 tasks API，无法加载 .task 模型")
+
+    drowsy_model_path = get_drowsy_task_model_path()
+    if not os.path.exists(drowsy_model_path):
+        raise FileNotFoundError(f"瞌睡模型不存在: {drowsy_model_path}")
+
+    base_options = mp.tasks.BaseOptions(model_asset_path=drowsy_model_path)
+    options = mp.tasks.vision.FaceLandmarkerOptions(
+        base_options=base_options,
+        running_mode=mp.tasks.vision.RunningMode.IMAGE,
+        num_faces=1,
+    )
+    detector = mp.tasks.vision.FaceLandmarker.create_from_options(options)
+    return detector, "tasks"
+
+
+def get_drowsy_landmarks(detector, backend, rgb_frame):
+    """获取人脸关键点"""
+    if backend == "solutions":
+        result = detector.process(rgb_frame)
+        if result.multi_face_landmarks:
+            return result.multi_face_landmarks[0].landmark
+        return None
+
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+    result = detector.detect(mp_image)
+    if result.face_landmarks:
+        return result.face_landmarks[0]
+    return None
+
+
+def ensure_drowsy_detector():
+    """按需初始化瞌睡检测器"""
+    global drowsy_detector, drowsy_detector_backend, drowsy_detector_ready, drowsy_detector_error_logged
+    if drowsy_detector_ready:
+        return True
+    try:
+        task_model_name = get_drowsy_task_model_name()
+        task_model_path = get_drowsy_task_model_path()
+        drowsy_detector, drowsy_detector_backend = create_drowsy_face_detector()
+        drowsy_detector_ready = True
+        backend_logger.info(f"瞌睡检测人脸关键点初始化成功，后端: {drowsy_detector_backend}")
+        backend_logger.info(f"当前使用 task 模型: {task_model_name} ({task_model_path})")
+        return True
+    except Exception as e:
+        if not drowsy_detector_error_logged:
+            backend_logger.error(f"瞌睡检测初始化失败: {e}")
+            drowsy_detector_error_logged = True
+        return False
+
+
+def trigger_drowsy_alarm(state, ear_value, mar_value, zone_name="当前区域"):
+    """触发瞌睡/打哈欠报警"""
+    global drowsy_last_alarm_time, drowsy_last_alarm_state
+    current_ts = time.time()
+    # 瞌睡模式不使用防抖时间，改为“状态变化触发一次”
+    if drowsy_last_alarm_state == state:
+        return False
+
+    drowsy_last_alarm_state = state
+    drowsy_last_alarm_time = current_ts
+
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if state == "Drowsy + Yawning":
+        title = "疑似瞌睡并打哈欠"
+    elif state == "Drowsy":
+        title = "疑似瞌睡"
+    else:
+        title = "频繁打哈欠"
+
+    alarm_data = {
+        "time": current_time,
+        "track_id": -1,
+        "class_id": None,
+        "class_name_cn": title,
+        "object_name": title,
+        "zone_id": "drowsy",
+        "zone_name": zone_name,
+        "position": {"x": 0.0, "y": 0.0},
+        "event_video": None,
+        "event_image": None,
+        "alarm_type": "drowsy",
+        "drowsy_state": state,
+        "ear": round(float(ear_value), 3),
+        "mar": round(float(mar_value), 3)
+    }
+    socketio.emit('alarm', alarm_data)
+    backend_logger.warning(
+        f"⚠️  瞌睡报警！状态={state}, EAR={ear_value:.3f}, MAR={mar_value:.3f}, 区域={zone_name}, 时间={current_time}"
+    )
+    return True
+
+
+def update_drowsy_status(frame, person_in_zone):
+    """执行一帧瞌睡检测并返回状态信息"""
+    global drowsy_eye_low_frames, drowsy_yawn_high_frames, drowsy_last_state, drowsy_last_alarm_state
+    if not person_in_zone:
+        drowsy_eye_low_frames = 0
+        drowsy_yawn_high_frames = 0
+        drowsy_ear_hist.clear()
+        drowsy_mar_hist.clear()
+        drowsy_last_state = "Normal"
+        drowsy_last_alarm_state = None
+        return {"state": "No person in zone", "ear": 0.0, "mar": 0.0, "has_face": False}
+
+    if not ensure_drowsy_detector():
+        return {"state": "Face detector unavailable", "ear": 0.0, "mar": 0.0, "has_face": False}
+
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    landmarks = get_drowsy_landmarks(drowsy_detector, drowsy_detector_backend, rgb)
+    if not landmarks:
+        drowsy_eye_low_frames = 0
+        drowsy_yawn_high_frames = 0
+        drowsy_last_state = "Face not detected"
+        drowsy_last_alarm_state = None
+        return {"state": "Face not detected", "ear": 0.0, "mar": 0.0, "has_face": False}
+
+    ear_value = (calc_ear(landmarks, LEFT_EYE_LANDMARKS) + calc_ear(landmarks, RIGHT_EYE_LANDMARKS)) / 2.0
+    mar_value = calc_mar(landmarks)
+    drowsy_ear_hist.append(ear_value)
+    drowsy_mar_hist.append(mar_value)
+    smooth_ear = float(np.mean(drowsy_ear_hist))
+    smooth_mar = float(np.mean(drowsy_mar_hist))
+
+    # 阈值默认来自独立脚本，支持通过报警配置按需覆盖
+    ear_threshold = float(alarm_config.get('drowsy_ear_threshold', 0.20))
+    mar_threshold = float(alarm_config.get('drowsy_mar_threshold', 0.60))
+    eye_frames_threshold = int(alarm_config.get('drowsy_eye_frames_threshold', 20))
+    yawn_frames_threshold = int(alarm_config.get('drowsy_yawn_frames_threshold', 12))
+
+    drowsy_eye_low_frames = drowsy_eye_low_frames + 1 if smooth_ear < ear_threshold else 0
+    drowsy_yawn_high_frames = drowsy_yawn_high_frames + 1 if smooth_mar > mar_threshold else 0
+
+    sleepy = drowsy_eye_low_frames >= eye_frames_threshold
+    yawning = drowsy_yawn_high_frames >= yawn_frames_threshold
+    state = "Normal"
+    if sleepy and yawning:
+        state = "Drowsy + Yawning"
+    elif sleepy:
+        state = "Drowsy"
+    elif yawning:
+        state = "Yawning"
+
+    drowsy_last_state = state
+    if state == "Normal":
+        drowsy_last_alarm_state = None
+    return {"state": state, "ear": smooth_ear, "mar": smooth_mar, "has_face": True}
+
+
 def video_reader():
     """在单独线程中读取视频帧"""
     cap = None
@@ -1598,7 +1882,7 @@ def video_reader():
 
 def detection_worker():
     """检测工作线程"""
-    global latest_frame, latest_results, latest_annotated_frame, zones, fps_counter, display_config, zone_has_people_mqtt_sent, inference_running, offpost_last_seen_person_ts, offpost_absence_alarm_sent, inference_running_profiles
+    global latest_frame, latest_results, latest_annotated_frame, zones, fps_counter, display_config, zone_has_people_mqtt_sent, inference_running, offpost_last_seen_person_ts, offpost_absence_alarm_sent, inference_running_profiles, drowsy_last_state
     
     while not stop_flag.is_set():
         try:
@@ -1658,6 +1942,7 @@ def detection_worker():
             enabled_zones = [z for z in zones if z.get('enabled', True) and len(z.get('points', [])) >= 3]
             no_zone_mode = len(enabled_zones) == 0  # 未配置区域时，默认全画面检测
             person_in_zone_this_frame = False
+            drowsy_status = {"state": "Normal", "ear": 0.0, "mar": 0.0, "has_face": False}
             if enabled_zones or no_zone_mode:
                 if results.boxes is not None and len(results.boxes) > 0:
                     boxes = results.boxes
@@ -1702,7 +1987,7 @@ def detection_worker():
                                     
                                     if in_zone:
                                         person_in_zone_this_frame = True
-                                        if current_detection_profile != DETECTION_PROFILE_OFFPOST:
+                                        if current_detection_profile not in (DETECTION_PROFILE_OFFPOST, DETECTION_PROFILE_DROWSY):
                                             track_id = int(track_ids[i])
                                             class_name_cn = get_class_name_cn(cls_id)
                                             trigger_alarm(track_id, bbox_center, zone_id, zone_name, cls_id, class_name_cn)
@@ -1727,6 +2012,18 @@ def detection_worker():
                     if not person_in_zone_this_frame and zone_has_people_mqtt_sent:
                         send_mqtt_message({"hasPeople": 0})
                         zone_has_people_mqtt_sent = False
+
+                if current_detection_profile == DETECTION_PROFILE_DROWSY:
+                    drowsy_status = update_drowsy_status(frame, person_in_zone_this_frame)
+                    drowsy_state = drowsy_status.get("state", "Normal")
+                    if drowsy_state in ("Drowsy", "Yawning", "Drowsy + Yawning"):
+                        target_zone_name = enabled_zones[0].get('name', '当前区域') if enabled_zones else '当前区域'
+                        trigger_drowsy_alarm(
+                            drowsy_state,
+                            drowsy_status.get("ear", 0.0),
+                            drowsy_status.get("mar", 0.0),
+                            target_zone_name
+                        )
             
             # 手动绘制检测框（只显示启用的类别）
             annotated_frame = frame.copy()
@@ -1916,6 +2213,26 @@ def detection_worker():
                     annotated_frame = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
             
             # 保存处理后的帧（用于MJPEG流）
+            if current_detection_profile == DETECTION_PROFILE_DROWSY:
+                status_text = drowsy_status.get("state", "Normal")
+                cv2.putText(
+                    annotated_frame,
+                    f"Drowsy: {status_text}",
+                    (20, 35),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.75,
+                    (0, 0, 255) if status_text in ("Drowsy", "Yawning", "Drowsy + Yawning") else (0, 255, 0),
+                    2
+                )
+                cv2.putText(
+                    annotated_frame,
+                    f"EAR: {drowsy_status.get('ear', 0.0):.3f}  MAR: {drowsy_status.get('mar', 0.0):.3f}",
+                    (20, 65),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65,
+                    (255, 255, 255),
+                    2
+                )
             latest_annotated_frame = annotated_frame.copy()
             
             # 编码为JPEG
@@ -1938,6 +2255,7 @@ def detection_worker():
                 "zones": zones,  # 发送所有区域（包括禁用的）
                 "detections": [],
                 "fps": round(fps_counter["current_fps"], 2),
+                "drowsy": drowsy_status if current_detection_profile == DETECTION_PROFILE_DROWSY else None,
                 "resolution": {
                     "width": video_info["width"],
                     "height": video_info["height"]
@@ -2132,7 +2450,7 @@ def save_zones_config(profile=None):
 
 def ensure_detection_profile(profile):
     """切换并加载指定检测档案配置"""
-    global current_detection_profile, alarm_triggered, zone_has_people_mqtt_sent, offpost_last_seen_person_ts, offpost_absence_alarm_sent
+    global current_detection_profile, alarm_triggered, zone_has_people_mqtt_sent, offpost_last_seen_person_ts, offpost_absence_alarm_sent, drowsy_eye_low_frames, drowsy_yawn_high_frames, drowsy_last_state, drowsy_last_alarm_state
 
     if profile not in DETECTION_PROFILE_FILES:
         raise ValueError("未知检测档案")
@@ -2148,7 +2466,17 @@ def ensure_detection_profile(profile):
     zone_has_people_mqtt_sent = False
     offpost_last_seen_person_ts = time.time()
     offpost_absence_alarm_sent = False
+    drowsy_eye_low_frames = 0
+    drowsy_yawn_high_frames = 0
+    drowsy_ear_hist.clear()
+    drowsy_mar_hist.clear()
+    drowsy_last_state = "Normal"
+    drowsy_last_alarm_state = None
     backend_logger.info(f"检测档案已切换: {profile}")
+    if profile == DETECTION_PROFILE_DROWSY:
+        backend_logger.info(
+            f"当前使用 task 模型: {get_drowsy_task_model_name()} ({get_drowsy_task_model_path()})"
+        )
 
 
 def get_profile_from_request_path(path):
@@ -2632,21 +2960,38 @@ def get_models():
     try:
         profile_cfg = model_profile_config.get(profile, {})
         profile_model = profile_cfg.get("model", current_model_name)
+        profile_task_model = profile_cfg.get("task_model", DROWSY_DEFAULT_TASK_MODEL)
         profile_imgsz = int(profile_cfg.get("imgsz", yolo_imgsz))
         models = []
-        if os.path.exists(MODELS_DIR):
-            for filename in os.listdir(MODELS_DIR):
-                if filename.endswith(('.engine', '.pt', '.onnx')):
-                    filepath = os.path.join(MODELS_DIR, filename)
-                    file_size = os.path.getsize(filepath)
-                    models.append({
-                        "name": filename,
-                        "size": file_size,
-                        "size_mb": round(file_size / (1024 * 1024), 2),
-                        "current": filename == profile_model
-                    })
+        if profile == DETECTION_PROFILE_DROWSY:
+            task_model_dir = os.path.join(MODELS_DIR, "sleep")
+            if os.path.exists(task_model_dir):
+                for filename in os.listdir(task_model_dir):
+                    if filename.endswith('.task'):
+                        filepath = os.path.join(task_model_dir, filename)
+                        file_size = os.path.getsize(filepath)
+                        models.append({
+                            "name": filename,
+                            "size": file_size,
+                            "size_mb": round(file_size / (1024 * 1024), 2),
+                            "current": filename == profile_task_model
+                        })
+        else:
+            model_dir = get_model_directory(profile)
+            if os.path.exists(model_dir):
+                for filename in os.listdir(model_dir):
+                    if filename.endswith(('.engine', '.pt', '.onnx')):
+                        filepath = os.path.join(model_dir, filename)
+                        file_size = os.path.getsize(filepath)
+                        models.append({
+                            "name": filename,
+                            "size": file_size,
+                            "size_mb": round(file_size / (1024 * 1024), 2),
+                            "current": filename == profile_model
+                        })
         models.sort(key=lambda x: x['name'])
-        return jsonify({"models": models, "current": profile_model, "imgsz": profile_imgsz})
+        current_value = profile_task_model if profile == DETECTION_PROFILE_DROWSY else profile_model
+        return jsonify({"models": models, "current": current_value, "imgsz": profile_imgsz})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -2656,7 +3001,7 @@ def get_models():
 @app.route('/api/drowsy/model', methods=['POST'])
 def set_model():
     """切换模型或更新推理配置（如 imgsz）"""
-    global current_model_name, model, yolo_imgsz
+    global current_model_name, model, yolo_imgsz, drowsy_detector, drowsy_detector_ready, drowsy_detector_error_logged
     profile = get_profile_from_request_path(request.path)
     if profile not in model_profile_config:
         model_profile_config[profile] = {"model": current_model_name, "imgsz": yolo_imgsz}
@@ -2691,7 +3036,32 @@ def set_model():
             })
         return jsonify({"success": False, "message": "未指定模型名称"}), 400
     
-    model_path = os.path.join(MODELS_DIR, model_name)
+    if profile == DETECTION_PROFILE_DROWSY:
+        if not str(model_name).endswith('.task'):
+            return jsonify({"success": False, "message": "瞌睡档案仅支持 .task 模型"}), 400
+        task_model_path = os.path.join(MODELS_DIR, "sleep", model_name)
+        if not os.path.exists(task_model_path):
+            return jsonify({"success": False, "message": f"模型文件不存在: {model_name}"}), 404
+        model_profile_config[profile]["task_model"] = model_name
+        if drowsy_detector is not None and hasattr(drowsy_detector, "close"):
+            try:
+                drowsy_detector.close()
+            except Exception:
+                pass
+        drowsy_detector = None
+        drowsy_detector_ready = False
+        drowsy_detector_error_logged = False
+        save_model_profile_config()
+        save_system_config()
+        return jsonify({
+            "success": True,
+            "message": f"瞌睡 task 模型已切换为 {model_name}",
+            "current_model": model_name,
+            "imgsz": model_profile_config[profile]["imgsz"]
+        })
+
+    model_dir = get_model_directory(profile)
+    model_path = os.path.join(model_dir, model_name)
     if not os.path.exists(model_path):
         return jsonify({"success": False, "message": f"模型文件不存在: {model_name}"}), 404
     
@@ -3717,6 +4087,30 @@ def set_alarm_config():
             else:
                 # 使用默认路径
                 alarm_config['event_save_path'] = os.path.join(BASE_DIR, "alarm_events")
+
+        if 'drowsy_ear_threshold' in data:
+            ear_threshold = float(data['drowsy_ear_threshold'])
+            if ear_threshold <= 0:
+                return jsonify({"success": False, "message": "EAR阈值必须大于0"}), 400
+            alarm_config['drowsy_ear_threshold'] = ear_threshold
+
+        if 'drowsy_mar_threshold' in data:
+            mar_threshold = float(data['drowsy_mar_threshold'])
+            if mar_threshold <= 0:
+                return jsonify({"success": False, "message": "MAR阈值必须大于0"}), 400
+            alarm_config['drowsy_mar_threshold'] = mar_threshold
+
+        if 'drowsy_eye_frames_threshold' in data:
+            eye_frame_threshold = int(data['drowsy_eye_frames_threshold'])
+            if eye_frame_threshold < 1:
+                return jsonify({"success": False, "message": "闭眼帧阈值必须大于0"}), 400
+            alarm_config['drowsy_eye_frames_threshold'] = eye_frame_threshold
+
+        if 'drowsy_yawn_frames_threshold' in data:
+            yawn_frame_threshold = int(data['drowsy_yawn_frames_threshold'])
+            if yawn_frame_threshold < 1:
+                return jsonify({"success": False, "message": "打哈欠帧阈值必须大于0"}), 400
+            alarm_config['drowsy_yawn_frames_threshold'] = yawn_frame_threshold
         
         save_alarm_config(profile)
         return jsonify({
