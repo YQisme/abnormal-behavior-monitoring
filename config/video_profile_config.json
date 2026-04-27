@@ -10,7 +10,7 @@
     "camera_check_interval": 5
   },
   "drowsy_monitor": {
-    "video_url": "1",
+    "video_url": "0",
     "camera_ip": "",
     "camera_check_interval": 5
   }

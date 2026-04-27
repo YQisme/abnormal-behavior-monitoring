@@ -45,7 +45,8 @@ if VITE_DEV_MODE:
     CORS(app, origins="*", supports_credentials=True)  # 允许所有来源，包括IP地址，支持凭证
 else:
     # 生产模式：提供静态文件
-    app = Flask(__name__, static_folder=FRONTEND_DIST_DIR, static_url_path='')
+    # 不在根路径挂载 Flask 静态路由，避免与前端 history 路由冲突导致 404
+    app = Flask(__name__)
     CORS(app, supports_credentials=True)  # 允许跨域请求，支持凭证
 
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
@@ -2330,6 +2331,28 @@ def index():
             return send_from_directory(FRONTEND_DIST_DIR, 'index.html')
         else:
             return send_from_directory(FRONTEND_DIR, 'index.html')
+
+@app.route('/<path:path>')
+def spa_fallback(path):
+    """支持前端 history 路由，避免刷新后 404"""
+    # 保留后端接口与 Socket.IO 路由
+    if path.startswith('api/') or path.startswith('socket.io'):
+        return jsonify({"error": "Not found"}), 404
+
+    if VITE_DEV_MODE:
+        # 开发模式：重定向到 Vite 开发服务器并保留路径
+        from flask import redirect, request
+        frontend_base = os.environ.get('VITE_FRONTEND_URL', f"http://{request.host.split(':')[0]}:5173").rstrip('/')
+        return redirect(f"{frontend_base}/{path}")
+
+    # 生产模式：优先返回真实静态资源，不存在则回退到 index.html
+    static_file = os.path.join(FRONTEND_DIST_DIR, path)
+    if os.path.exists(static_file):
+        return send_from_directory(FRONTEND_DIST_DIR, path)
+
+    if os.path.exists(os.path.join(FRONTEND_DIST_DIR, 'index.html')):
+        return send_from_directory(FRONTEND_DIST_DIR, 'index.html')
+    return send_from_directory(FRONTEND_DIR, 'index.html')
 
 
 # REST API 路由 - 多区域管理
