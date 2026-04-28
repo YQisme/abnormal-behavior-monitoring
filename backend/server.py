@@ -15,6 +15,7 @@ import base64
 import math
 import gc
 import shutil
+import copy
 import numpy as np
 from datetime import datetime
 from ultralytics import YOLO
@@ -77,6 +78,9 @@ frame_queue = queue.Queue(maxsize=2)
 stop_flag = threading.Event()
 event_frame_buffer = deque(maxlen=180)  # 事件视频前缓存（默认约 6 秒 @30fps，运行时会按配置动态调整）
 event_frame_buffer_lock = threading.Lock()
+profile_frame_queues = {}
+profile_event_frame_buffers = {}
+profile_event_frame_buffer_locks = {}
 
 # 日志发送线程
 def log_sender():
@@ -358,9 +362,57 @@ camera_check_interval = 5  # 摄像头检测间隔（秒）
 camera_last_status = "unknown"  # 上次检测到的状态，用于判断状态变化
 camera_offline_alarm_triggered = {}  # 摄像头离线报警记录，用于防抖
 model = None  # 模型对象，延迟加载
+models_by_profile = {
+    DETECTION_PROFILE_ZONE: None,
+    DETECTION_PROFILE_OFFPOST: None,
+    DETECTION_PROFILE_DROWSY: None,
+}
 inference_running = False  # 是否存在任一档案在运行（兼容旧状态字段）
 auto_start_inference = False  # 服务启动后是否自动开始推理
 inference_state_lock = threading.Lock()  # 推理状态锁
+
+# 多档案运行时帧缓存（兼容旧架构：先用于按档案读取视频帧，后续可扩展为独立线程/独立模型上下文）
+profile_runtime_frames = {
+    DETECTION_PROFILE_ZONE: {"latest_frame": None, "latest_annotated_frame": None},
+    DETECTION_PROFILE_OFFPOST: {"latest_frame": None, "latest_annotated_frame": None},
+    DETECTION_PROFILE_DROWSY: {"latest_frame": None, "latest_annotated_frame": None},
+}
+for _profile_key in (DETECTION_PROFILE_ZONE, DETECTION_PROFILE_OFFPOST, DETECTION_PROFILE_DROWSY):
+    profile_frame_queues[_profile_key] = queue.Queue(maxsize=2)
+    profile_event_frame_buffers[_profile_key] = deque(maxlen=180)
+    profile_event_frame_buffer_locks[_profile_key] = threading.Lock()
+
+def _build_profile_runtime_state():
+    return {
+        "alarm_triggered": {},
+        "zone_has_people_mqtt_sent": False,
+        "offpost_last_seen_person_ts": time.time(),
+        "offpost_absence_alarm_sent": False,
+        "offpost_recovery_candidate_ts": None,
+        "drowsy_ear_hist": deque(maxlen=5),
+        "drowsy_mar_hist": deque(maxlen=5),
+        "drowsy_eye_low_frames": 0,
+        "drowsy_yawn_high_frames": 0,
+        "drowsy_last_state": "Normal",
+        "drowsy_last_alarm_state": None,
+        "drowsy_last_alarm_time": 0.0,
+    }
+
+profile_runtime_states = {
+    DETECTION_PROFILE_ZONE: _build_profile_runtime_state(),
+    DETECTION_PROFILE_OFFPOST: _build_profile_runtime_state(),
+    DETECTION_PROFILE_DROWSY: _build_profile_runtime_state(),
+}
+profile_runtime_configs = {
+    DETECTION_PROFILE_ZONE: {"zones": [], "alarm": {}},
+    DETECTION_PROFILE_OFFPOST: {"zones": [], "alarm": {}},
+    DETECTION_PROFILE_DROWSY: {"zones": [], "alarm": {}},
+}
+profile_fps_counters = {
+    DETECTION_PROFILE_ZONE: {"frame_count": 0, "last_time": time.time(), "current_fps": 0.0},
+    DETECTION_PROFILE_OFFPOST: {"frame_count": 0, "last_time": time.time(), "current_fps": 0.0},
+    DETECTION_PROFILE_DROWSY: {"frame_count": 0, "last_time": time.time(), "current_fps": 0.0},
+}
 
 # 从RTSP URL中提取IP地址
 def extract_ip_from_rtsp(rtsp_url):
@@ -724,53 +776,62 @@ def load_model_classes(model_name):
         model_classes = DEFAULT_COCO_CLASSES
         model_classes_cn = DEFAULT_COCO_CLASSES_CN
 
-def load_model():
+def load_model(profile=None):
     """加载YOLO模型"""
-    global model, current_model_name, device, gpu_available
+    global model, current_model_name, device, gpu_available, models_by_profile
+    profile = profile or current_detection_profile
     
     # 重新检测GPU（可能在运行时发生变化）
     gpu_available, device = check_gpu_available()
     
+    profile_cfg = model_profile_config.get(profile, {})
+    model_name = profile_cfg.get("model", current_model_name)
     # .task 属于 MediaPipe 模型，不能用于 YOLO；瞌睡档案下若误入该值，自动切回 YOLO 默认模型
-    if str(current_model_name).endswith('.task'):
-        current_model_name = "yolo26m_640_int8.engine"
+    if str(model_name).endswith('.task'):
+        model_name = "yolo26m_640_int8.engine"
 
-    model_dir = get_model_directory(current_detection_profile)
-    model_path = os.path.join(model_dir, current_model_name)
+    model_dir = get_model_directory(profile)
+    model_path = os.path.join(model_dir, model_name)
     if not os.path.exists(model_path):
-        available_models = list_profile_models(current_detection_profile)
+        available_models = list_profile_models(profile)
         if available_models:
-            current_model_name = available_models[0]
-            model_path = os.path.join(model_dir, current_model_name)
-            backend_logger.warning(f"模型文件不存在，已切换为当前档案可用模型: {current_model_name}")
+            model_name = available_models[0]
+            model_path = os.path.join(model_dir, model_name)
+            backend_logger.warning(f"模型文件不存在，已切换为当前档案可用模型: {model_name}")
         else:
             # 兜底：若当前档案目录无YOLO模型，回退到根目录默认模型，避免推理流程中断
             fallback_model = "yolo26m_640_int8.engine"
             fallback_path = os.path.join(MODELS_DIR, fallback_model)
             if not os.path.exists(fallback_path):
                 raise FileNotFoundError(f"未找到可用模型，档案目录: {model_dir}")
-            current_model_name = fallback_model
+            model_name = fallback_model
             model_path = fallback_path
-            if current_detection_profile == DETECTION_PROFILE_DROWSY:
-                backend_logger.info(f"瞌睡档案未配置YOLO模型，使用默认人员检测模型: {current_model_name}")
+            if profile == DETECTION_PROFILE_DROWSY:
+                backend_logger.info(f"瞌睡档案未配置YOLO模型，使用默认人员检测模型: {model_name}")
             else:
-                backend_logger.warning(f"档案目录无可用模型，回退到默认模型: {current_model_name}")
+                backend_logger.warning(f"档案目录无可用模型，回退到默认模型: {model_name}")
     
     try:
         with model_lock:
-            if model is not None:
+            old_model = models_by_profile.get(profile)
+            if old_model is not None:
                 # 释放旧模型（如果有的话）
-                del model
+                del old_model
             
             # YOLO初始化时不接受device参数，设备在使用时指定
-            model = YOLO(model_path)
+            loaded_model = YOLO(model_path)
+            models_by_profile[profile] = loaded_model
+            if profile == current_detection_profile:
+                model = loaded_model
+                current_model_name = model_name
             if gpu_available:
-                backend_logger.info(f"模型已加载: {current_model_name} (将使用GPU模式)")
+                backend_logger.info(f"模型已加载[{profile}]: {model_name} (将使用GPU模式)")
             else:
-                backend_logger.info(f"模型已加载: {current_model_name} (将使用CPU模式)")
+                backend_logger.info(f"模型已加载[{profile}]: {model_name} (将使用CPU模式)")
         
         # 加载模型对应的类别配置
-        load_model_classes(current_model_name)
+        if profile == current_detection_profile:
+            load_model_classes(model_name)
     except Exception as e:
         backend_logger.error(f"加载模型失败: {e}")
         raise
@@ -955,6 +1016,8 @@ def load_alarm_config(profile=None):
                 os.makedirs(os.path.join(event_path, event_type_dir, "videos"), exist_ok=True)
             if alarm_config.get('save_event_image'):
                 os.makedirs(os.path.join(event_path, event_type_dir, "images"), exist_ok=True)
+    profile_runtime_configs.setdefault(profile, {})
+    profile_runtime_configs[profile]["alarm"] = copy.deepcopy(alarm_config)
 
 def save_alarm_config(profile=None):
     """保存报警配置到文件"""
@@ -1235,9 +1298,10 @@ def _resolve_event_type_dir(event_type):
     return "zone"
 
 
-def _get_event_frame_buffer_maxlen():
+def _get_event_frame_buffer_maxlen(alarm_cfg=None):
     """根据预录秒数和FPS估算事件前缓存上限，避免长期占用过大内存。"""
-    pre_seconds_cfg = float(alarm_config.get('event_video_pre_seconds', 5.0))
+    cfg = alarm_cfg or alarm_config
+    pre_seconds_cfg = float(cfg.get('event_video_pre_seconds', 5.0))
     pre_seconds = max(0.0, min(pre_seconds_cfg, 15.0))
     fps = float(video_info.get("fps", 0.0))
     if fps <= 0:
@@ -1248,35 +1312,46 @@ def _get_event_frame_buffer_maxlen():
     return max(30, min(estimated, 240))
 
 
-def _update_event_frame_buffer(frame):
+def _update_event_frame_buffer(frame, profile=None, alarm_cfg=None):
     """按需缓存事件前帧：关闭事件视频时不缓存，开启时按动态上限缓存。"""
-    global event_frame_buffer
-    if not alarm_config.get('save_event_video', True):
-        with event_frame_buffer_lock:
-            if len(event_frame_buffer) > 0:
-                event_frame_buffer.clear()
+    profile = profile or current_detection_profile
+    cfg = alarm_cfg or profile_runtime_configs.get(profile, {}).get("alarm", alarm_config)
+    if not cfg.get('save_event_video', True):
+        lock = profile_event_frame_buffer_locks.get(profile, event_frame_buffer_lock)
+        buf = profile_event_frame_buffers.get(profile, event_frame_buffer)
+        with lock:
+            if len(buf) > 0:
+                buf.clear()
         return
 
-    target_maxlen = _get_event_frame_buffer_maxlen()
-    with event_frame_buffer_lock:
-        if event_frame_buffer.maxlen != target_maxlen:
-            event_frame_buffer = deque(event_frame_buffer, maxlen=target_maxlen)
-        event_frame_buffer.append((time.time(), frame.copy()))
+    target_maxlen = _get_event_frame_buffer_maxlen(cfg)
+    lock = profile_event_frame_buffer_locks.get(profile, event_frame_buffer_lock)
+    with lock:
+        profile_buf = profile_event_frame_buffers.get(profile)
+        if profile_buf is None:
+            profile_buf = deque(maxlen=target_maxlen)
+            profile_event_frame_buffers[profile] = profile_buf
+        if profile_buf.maxlen != target_maxlen:
+            profile_buf = deque(profile_buf, maxlen=target_maxlen)
+            profile_event_frame_buffers[profile] = profile_buf
+        profile_buf.append((time.time(), frame.copy()))
 
 
-def save_alarm_event_video(track_id, zone_id, zone_name, class_id, class_name_cn, bbox_center, event_type="zone"):
+def save_alarm_event_video(track_id, zone_id, zone_name, class_id, class_name_cn, bbox_center, event_type="zone", profile=None, alarm_cfg=None):
     """保存报警事件视频（基于当前帧缓冲录制，兼容 RTSP/本地摄像头）"""
     try:
-        if not alarm_config.get('save_event_video', True):
+        profile = profile or current_detection_profile
+        cfg = alarm_cfg or profile_runtime_configs.get(profile, {}).get("alarm", alarm_config)
+        if not cfg.get('save_event_video', True):
             return None
         
-        event_path = alarm_config.get('event_save_path', os.path.join(BASE_DIR, "alarm_events"))
+        event_path = cfg.get('event_save_path', os.path.join(BASE_DIR, "alarm_events"))
         event_type_dir = _resolve_event_type_dir(event_type)
         video_dir = os.path.join(event_path, event_type_dir, "videos")
         os.makedirs(video_dir, exist_ok=True)
         
-        duration = alarm_config.get('event_video_duration', 10)
-        pre_seconds_cfg = float(alarm_config.get('event_video_pre_seconds', 5.0))
+        duration = cfg.get('event_video_duration', 10)
+        pre_seconds_cfg = float(cfg.get('event_video_pre_seconds', 5.0))
         pre_seconds = max(0.0, min(pre_seconds_cfg, float(duration)))
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         object_name = class_name_cn if class_name_cn else f"class_{class_id}"
@@ -1289,7 +1364,12 @@ def save_alarm_event_video(track_id, zone_id, zone_name, class_id, class_name_cn
         # 在后台线程中执行，避免阻塞
         def record_video():
             try:
-                base_frame = latest_annotated_frame if latest_annotated_frame is not None else latest_frame
+                runtime_frames = profile_runtime_frames.get(profile, {})
+                base_frame = runtime_frames.get("latest_annotated_frame")
+                if base_frame is None:
+                    base_frame = runtime_frames.get("latest_frame")
+                if base_frame is None:
+                    base_frame = latest_annotated_frame if latest_annotated_frame is not None else latest_frame
                 if base_frame is None:
                     backend_logger.error(f"报警事件视频录制失败：无可用帧 {filename}")
                     return
@@ -1312,10 +1392,12 @@ def save_alarm_event_video(track_id, zone_id, zone_name, class_id, class_name_cn
 
                 # 1) 先写入“事件前缓存”帧（按时间窗截取）
                 pre_window_start = trigger_ts - pre_seconds
-                with event_frame_buffer_lock:
+                profile_buf = profile_event_frame_buffers.get(profile, event_frame_buffer)
+                profile_buf_lock = profile_event_frame_buffer_locks.get(profile, event_frame_buffer_lock)
+                with profile_buf_lock:
                     cached_frames = [
                         cached_frame.copy()
-                        for ts, cached_frame in event_frame_buffer
+                        for ts, cached_frame in profile_buf
                         if ts >= pre_window_start
                     ]
                 for cached in cached_frames:
@@ -1328,7 +1410,12 @@ def save_alarm_event_video(track_id, zone_id, zone_name, class_id, class_name_cn
                 post_seconds = max(0.0, float(duration) - pre_seconds)
                 start_ts = time.time()
                 while time.time() - start_ts < post_seconds:
-                    frame_src = latest_annotated_frame if latest_annotated_frame is not None else latest_frame
+                    runtime_frames = profile_runtime_frames.get(profile, {})
+                    frame_src = runtime_frames.get("latest_annotated_frame")
+                    if frame_src is None:
+                        frame_src = runtime_frames.get("latest_frame")
+                    if frame_src is None:
+                        frame_src = latest_annotated_frame if latest_annotated_frame is not None else latest_frame
                     if frame_src is None:
                         time.sleep(0.02)
                         continue
@@ -1370,16 +1457,22 @@ def save_alarm_event_video(track_id, zone_id, zone_name, class_id, class_name_cn
         return None
 
 
-def save_alarm_event_image(track_id, zone_id, zone_name, class_id, class_name_cn, bbox_center, event_type="zone"):
+def save_alarm_event_image(track_id, zone_id, zone_name, class_id, class_name_cn, bbox_center, event_type="zone", profile=None, alarm_cfg=None):
     """保存报警事件图片"""
     try:
-        if not alarm_config.get('save_event_image', True):
+        profile = profile or current_detection_profile
+        cfg = alarm_cfg or profile_runtime_configs.get(profile, {}).get("alarm", alarm_config)
+        if not cfg.get('save_event_image', True):
             return None
         
-        if latest_annotated_frame is None:
+        runtime_frames = profile_runtime_frames.get(profile, {})
+        annotated_src = runtime_frames.get("latest_annotated_frame")
+        if annotated_src is None:
+            annotated_src = latest_annotated_frame
+        if annotated_src is None:
             return None
         
-        event_path = alarm_config.get('event_save_path', os.path.join(BASE_DIR, "alarm_events"))
+        event_path = cfg.get('event_save_path', os.path.join(BASE_DIR, "alarm_events"))
         event_type_dir = _resolve_event_type_dir(event_type)
         image_dir = os.path.join(event_path, event_type_dir, "images")
         os.makedirs(image_dir, exist_ok=True)
@@ -1393,7 +1486,7 @@ def save_alarm_event_image(track_id, zone_id, zone_name, class_id, class_name_cn
         filepath = os.path.join(image_dir, filename)
         
         # 保存处理后的帧（包含检测框和区域）
-        frame = latest_annotated_frame.copy()
+        frame = annotated_src.copy()
         
         # 直接保存当前已标注帧，避免字体缺失导致的中文乱码
         cv2.imwrite(filepath, frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
@@ -1551,11 +1644,14 @@ def occlusion_detector():
     
     backend_logger.info("遮挡检测线程已停止")
 
-def trigger_alarm(track_id, bbox_center, zone_id, zone_name, class_id=None, class_name_cn=None):
+def trigger_alarm(track_id, bbox_center, zone_id, zone_name, class_id=None, class_name_cn=None, profile=None):
     """触发报警"""
-    global alarm_triggered, zone_has_people_mqtt_sent, alarm_config
+    profile = profile or current_detection_profile
+    runtime_state = profile_runtime_states.setdefault(profile, _build_profile_runtime_state())
+    alarm_cfg = profile_runtime_configs.get(profile, {}).get("alarm", alarm_config)
+    alarm_triggered_map = runtime_state["alarm_triggered"]
     # 离岗监测模式下不应触发“有人进入区域”报警，避免误报与错误文案
-    if current_detection_profile == DETECTION_PROFILE_OFFPOST:
+    if profile == DETECTION_PROFILE_OFFPOST:
         return False
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
@@ -1563,37 +1659,37 @@ def trigger_alarm(track_id, bbox_center, zone_id, zone_name, class_id=None, clas
     alarm_key = (track_id, class_id if class_id is not None else -1, zone_id)
     
     # 检查是否已报警过（如果配置了相同ID只报警一次）
-    once_per_id = alarm_config.get('once_per_id', False)
+    once_per_id = alarm_cfg.get('once_per_id', False)
     if once_per_id:
         # 如果已报警过，直接返回（整个生命周期只报警一次）
-        if alarm_key in alarm_triggered:
+        if alarm_key in alarm_triggered_map:
             return False
         # 记录已报警（使用特殊标记，表示永久报警过）
-        alarm_triggered[alarm_key] = float('inf')
+        alarm_triggered_map[alarm_key] = float('inf')
     else:
         # 使用防抖时间机制
-        debounce_time = alarm_config.get('debounce_time', 5.0)
-        if alarm_key in alarm_triggered:
+        debounce_time = alarm_cfg.get('debounce_time', 5.0)
+        if alarm_key in alarm_triggered_map:
             # 检查是否是永久标记（inf表示已永久报警过）
-            if alarm_triggered[alarm_key] == float('inf'):
+            if alarm_triggered_map[alarm_key] == float('inf'):
                 return False
             # 检查是否在防抖时间内
-            if time.time() - alarm_triggered[alarm_key] < debounce_time:
+            if time.time() - alarm_triggered_map[alarm_key] < debounce_time:
                 return False
-        alarm_triggered[alarm_key] = time.time()
+        alarm_triggered_map[alarm_key] = time.time()
     
     object_name = class_name_cn if class_name_cn else "对象"
     
     # 保存报警事件（视频和图片）
     event_video_filename = None
     event_image_filename = None
-    if alarm_config.get('save_event_video', True):
+    if alarm_cfg.get('save_event_video', True):
         event_video_filename = save_alarm_event_video(
-            track_id, zone_id, zone_name, class_id, class_name_cn, bbox_center, event_type="zone"
+            track_id, zone_id, zone_name, class_id, class_name_cn, bbox_center, event_type="zone", profile=profile, alarm_cfg=alarm_cfg
         )
-    if alarm_config.get('save_event_image', True):
+    if alarm_cfg.get('save_event_image', True):
         event_image_filename = save_alarm_event_image(
-            track_id, zone_id, zone_name, class_id, class_name_cn, bbox_center, event_type="zone"
+            track_id, zone_id, zone_name, class_id, class_name_cn, bbox_center, event_type="zone", profile=profile, alarm_cfg=alarm_cfg
         )
     
     alarm_data = {
@@ -1607,9 +1703,10 @@ def trigger_alarm(track_id, bbox_center, zone_id, zone_name, class_id=None, clas
         "position": {"x": float(bbox_center[0]), "y": float(bbox_center[1])},
         "event_video": event_video_filename,
         "event_image": event_image_filename,
-        "popup_alarm_enabled": bool(alarm_config.get('popup_alarm_enabled', True)),
-        "sound_light_alarm_enabled": bool(alarm_config.get('sound_light_alarm_enabled', True)),
-        "alarm_type": "zone"  # 报警类型：区域报警
+        "popup_alarm_enabled": bool(alarm_cfg.get('popup_alarm_enabled', True)),
+        "sound_light_alarm_enabled": bool(alarm_cfg.get('sound_light_alarm_enabled', True)),
+        "alarm_type": "zone",  # 报警类型：区域报警
+        "profile": profile
     }
     
     # 报警事件统一推送给前端；前端按开关执行弹窗/声光动作
@@ -1619,10 +1716,12 @@ def trigger_alarm(track_id, bbox_center, zone_id, zone_name, class_id=None, clas
     return True
 
 
-def trigger_offpost_absence_alarm(absence_duration, zone_name='当前区域'):
+def trigger_offpost_absence_alarm(absence_duration, zone_name='当前区域', profile=None):
     """离岗监测：持续无人触发报警"""
-    global offpost_absence_alarm_sent, zone_has_people_mqtt_sent
-    if offpost_absence_alarm_sent:
+    profile = profile or current_detection_profile
+    runtime_state = profile_runtime_states.setdefault(profile, _build_profile_runtime_state())
+    alarm_cfg = profile_runtime_configs.get(profile, {}).get("alarm", alarm_config)
+    if runtime_state["offpost_absence_alarm_sent"]:
         return False
 
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1633,13 +1732,13 @@ def trigger_offpost_absence_alarm(absence_duration, zone_name='当前区域'):
     offpost_zone_id = "offpost"
     offpost_center = [0.0, 0.0]
     offpost_title = "人员离岗"
-    if alarm_config.get('save_event_video', True):
+    if alarm_cfg.get('save_event_video', True):
         event_video_filename = save_alarm_event_video(
-            offpost_track_id, offpost_zone_id, zone_name, None, offpost_title, offpost_center, event_type="offpost_absence"
+            offpost_track_id, offpost_zone_id, zone_name, None, offpost_title, offpost_center, event_type="offpost_absence", profile=profile, alarm_cfg=alarm_cfg
         )
-    if alarm_config.get('save_event_image', True):
+    if alarm_cfg.get('save_event_image', True):
         event_image_filename = save_alarm_event_image(
-            offpost_track_id, offpost_zone_id, zone_name, None, offpost_title, offpost_center, event_type="offpost_absence"
+            offpost_track_id, offpost_zone_id, zone_name, None, offpost_title, offpost_center, event_type="offpost_absence", profile=profile, alarm_cfg=alarm_cfg
         )
 
     alarm_data = {
@@ -1654,19 +1753,22 @@ def trigger_offpost_absence_alarm(absence_duration, zone_name='当前区域'):
         "event_video": event_video_filename,
         "event_image": event_image_filename,
         "absence_duration": round(float(absence_duration), 2),
-        "popup_alarm_enabled": bool(alarm_config.get('popup_alarm_enabled', True)),
-        "sound_light_alarm_enabled": bool(alarm_config.get('sound_light_alarm_enabled', True)),
-        "alarm_type": "offpost_absence"
+        "popup_alarm_enabled": bool(alarm_cfg.get('popup_alarm_enabled', True)),
+        "sound_light_alarm_enabled": bool(alarm_cfg.get('sound_light_alarm_enabled', True)),
+        "alarm_type": "offpost_absence",
+        "profile": profile
     }
 
     socketio.emit('alarm', alarm_data)
     backend_logger.warning(f"⚠️  离岗报警！区域【{zone_name}】已持续无人 {absence_duration:.2f} 秒，时间: {current_time}")
-    offpost_absence_alarm_sent = True
+    runtime_state["offpost_absence_alarm_sent"] = True
     return True
 
 
-def trigger_offpost_recovery_alarm(absence_duration, zone_name='当前区域'):
+def trigger_offpost_recovery_alarm(absence_duration, zone_name='当前区域', profile=None):
     """离岗监测：人员重新出现时触发恢复报警"""
+    profile = profile or current_detection_profile
+    alarm_cfg = profile_runtime_configs.get(profile, {}).get("alarm", alarm_config)
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     event_video_filename = None
     event_image_filename = None
@@ -1674,13 +1776,13 @@ def trigger_offpost_recovery_alarm(absence_duration, zone_name='当前区域'):
     offpost_zone_id = "offpost"
     offpost_center = [0.0, 0.0]
     offpost_title = "人员在岗"
-    if alarm_config.get('save_event_video', True):
+    if alarm_cfg.get('save_event_video', True):
         event_video_filename = save_alarm_event_video(
-            offpost_track_id, offpost_zone_id, zone_name, None, offpost_title, offpost_center, event_type="offpost_recovery"
+            offpost_track_id, offpost_zone_id, zone_name, None, offpost_title, offpost_center, event_type="offpost_recovery", profile=profile, alarm_cfg=alarm_cfg
         )
-    if alarm_config.get('save_event_image', True):
+    if alarm_cfg.get('save_event_image', True):
         event_image_filename = save_alarm_event_image(
-            offpost_track_id, offpost_zone_id, zone_name, None, offpost_title, offpost_center, event_type="offpost_recovery"
+            offpost_track_id, offpost_zone_id, zone_name, None, offpost_title, offpost_center, event_type="offpost_recovery", profile=profile, alarm_cfg=alarm_cfg
         )
 
     alarm_data = {
@@ -1695,9 +1797,10 @@ def trigger_offpost_recovery_alarm(absence_duration, zone_name='当前区域'):
         "event_video": event_video_filename,
         "event_image": event_image_filename,
         "absence_duration": round(float(absence_duration), 2),
-        "popup_alarm_enabled": bool(alarm_config.get('popup_alarm_enabled', True)),
-        "sound_light_alarm_enabled": bool(alarm_config.get('sound_light_alarm_enabled', True)),
-        "alarm_type": "offpost_recovery"
+        "popup_alarm_enabled": bool(alarm_cfg.get('popup_alarm_enabled', True)),
+        "sound_light_alarm_enabled": bool(alarm_cfg.get('sound_light_alarm_enabled', True)),
+        "alarm_type": "offpost_recovery",
+        "profile": profile
     }
 
     socketio.emit('alarm', alarm_data)
@@ -1787,16 +1890,18 @@ def ensure_drowsy_detector():
         return False
 
 
-def trigger_drowsy_alarm(state, ear_value, mar_value, zone_name="当前区域"):
+def trigger_drowsy_alarm(state, ear_value, mar_value, zone_name="当前区域", profile=None):
     """触发瞌睡/打哈欠报警"""
-    global drowsy_last_alarm_time, drowsy_last_alarm_state
+    profile = profile or current_detection_profile
+    runtime_state = profile_runtime_states.setdefault(profile, _build_profile_runtime_state())
+    alarm_cfg = profile_runtime_configs.get(profile, {}).get("alarm", alarm_config)
     current_ts = time.time()
     # 瞌睡模式不使用防抖时间，改为“状态变化触发一次”
-    if drowsy_last_alarm_state == state:
+    if runtime_state["drowsy_last_alarm_state"] == state:
         return False
 
-    drowsy_last_alarm_state = state
-    drowsy_last_alarm_time = current_ts
+    runtime_state["drowsy_last_alarm_state"] = state
+    runtime_state["drowsy_last_alarm_time"] = current_ts
 
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     if state == "Drowsy + Yawning":
@@ -1812,13 +1917,13 @@ def trigger_drowsy_alarm(state, ear_value, mar_value, zone_name="当前区域"):
     drowsy_track_id = -1
     drowsy_zone_id = "drowsy"
     drowsy_center = [0.0, 0.0]
-    if alarm_config.get('save_event_video', True):
+    if alarm_cfg.get('save_event_video', True):
         event_video_filename = save_alarm_event_video(
-            drowsy_track_id, drowsy_zone_id, zone_name, None, title, drowsy_center, event_type="drowsy"
+            drowsy_track_id, drowsy_zone_id, zone_name, None, title, drowsy_center, event_type="drowsy", profile=profile, alarm_cfg=alarm_cfg
         )
-    if alarm_config.get('save_event_image', True):
+    if alarm_cfg.get('save_event_image', True):
         event_image_filename = save_alarm_event_image(
-            drowsy_track_id, drowsy_zone_id, zone_name, None, title, drowsy_center, event_type="drowsy"
+            drowsy_track_id, drowsy_zone_id, zone_name, None, title, drowsy_center, event_type="drowsy", profile=profile, alarm_cfg=alarm_cfg
         )
 
     alarm_data = {
@@ -1832,9 +1937,10 @@ def trigger_drowsy_alarm(state, ear_value, mar_value, zone_name="当前区域"):
         "position": {"x": drowsy_center[0], "y": drowsy_center[1]},
         "event_video": event_video_filename,
         "event_image": event_image_filename,
-        "popup_alarm_enabled": bool(alarm_config.get('popup_alarm_enabled', True)),
-        "sound_light_alarm_enabled": bool(alarm_config.get('sound_light_alarm_enabled', True)),
+        "popup_alarm_enabled": bool(alarm_cfg.get('popup_alarm_enabled', True)),
+        "sound_light_alarm_enabled": bool(alarm_cfg.get('sound_light_alarm_enabled', True)),
         "alarm_type": "drowsy",
+        "profile": profile,
         "drowsy_state": state,
         "ear": round(float(ear_value), 3),
         "mar": round(float(mar_value), 3)
@@ -1846,16 +1952,17 @@ def trigger_drowsy_alarm(state, ear_value, mar_value, zone_name="当前区域"):
     return True
 
 
-def update_drowsy_status(frame, person_in_zone):
+def update_drowsy_status(frame, person_in_zone, profile=None):
     """执行一帧瞌睡检测并返回状态信息"""
-    global drowsy_eye_low_frames, drowsy_yawn_high_frames, drowsy_last_state, drowsy_last_alarm_state
+    profile = profile or current_detection_profile
+    runtime_state = profile_runtime_states.setdefault(profile, _build_profile_runtime_state())
     if not person_in_zone:
-        drowsy_eye_low_frames = 0
-        drowsy_yawn_high_frames = 0
-        drowsy_ear_hist.clear()
-        drowsy_mar_hist.clear()
-        drowsy_last_state = "Normal"
-        drowsy_last_alarm_state = None
+        runtime_state["drowsy_eye_low_frames"] = 0
+        runtime_state["drowsy_yawn_high_frames"] = 0
+        runtime_state["drowsy_ear_hist"].clear()
+        runtime_state["drowsy_mar_hist"].clear()
+        runtime_state["drowsy_last_state"] = "Normal"
+        runtime_state["drowsy_last_alarm_state"] = None
         return {"state": "No person in zone", "ear": 0.0, "mar": 0.0, "has_face": False}
 
     if not ensure_drowsy_detector():
@@ -1864,18 +1971,18 @@ def update_drowsy_status(frame, person_in_zone):
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     landmarks = get_drowsy_landmarks(drowsy_detector, drowsy_detector_backend, rgb)
     if not landmarks:
-        drowsy_eye_low_frames = 0
-        drowsy_yawn_high_frames = 0
-        drowsy_last_state = "Face not detected"
-        drowsy_last_alarm_state = None
+        runtime_state["drowsy_eye_low_frames"] = 0
+        runtime_state["drowsy_yawn_high_frames"] = 0
+        runtime_state["drowsy_last_state"] = "Face not detected"
+        runtime_state["drowsy_last_alarm_state"] = None
         return {"state": "Face not detected", "ear": 0.0, "mar": 0.0, "has_face": False}
 
     ear_value = (calc_ear(landmarks, LEFT_EYE_LANDMARKS) + calc_ear(landmarks, RIGHT_EYE_LANDMARKS)) / 2.0
     mar_value = calc_mar(landmarks)
-    drowsy_ear_hist.append(ear_value)
-    drowsy_mar_hist.append(mar_value)
-    smooth_ear = float(np.mean(drowsy_ear_hist))
-    smooth_mar = float(np.mean(drowsy_mar_hist))
+    runtime_state["drowsy_ear_hist"].append(ear_value)
+    runtime_state["drowsy_mar_hist"].append(mar_value)
+    smooth_ear = float(np.mean(runtime_state["drowsy_ear_hist"]))
+    smooth_mar = float(np.mean(runtime_state["drowsy_mar_hist"]))
 
     # 阈值默认来自独立脚本，支持通过报警配置按需覆盖
     ear_threshold = float(alarm_config.get('drowsy_ear_threshold', 0.20))
@@ -1883,11 +1990,11 @@ def update_drowsy_status(frame, person_in_zone):
     eye_frames_threshold = int(alarm_config.get('drowsy_eye_frames_threshold', 20))
     yawn_frames_threshold = int(alarm_config.get('drowsy_yawn_frames_threshold', 12))
 
-    drowsy_eye_low_frames = drowsy_eye_low_frames + 1 if smooth_ear < ear_threshold else 0
-    drowsy_yawn_high_frames = drowsy_yawn_high_frames + 1 if smooth_mar > mar_threshold else 0
+    runtime_state["drowsy_eye_low_frames"] = runtime_state["drowsy_eye_low_frames"] + 1 if smooth_ear < ear_threshold else 0
+    runtime_state["drowsy_yawn_high_frames"] = runtime_state["drowsy_yawn_high_frames"] + 1 if smooth_mar > mar_threshold else 0
 
-    sleepy = drowsy_eye_low_frames >= eye_frames_threshold
-    yawning = drowsy_yawn_high_frames >= yawn_frames_threshold
+    sleepy = runtime_state["drowsy_eye_low_frames"] >= eye_frames_threshold
+    yawning = runtime_state["drowsy_yawn_high_frames"] >= yawn_frames_threshold
     state = "Normal"
     if sleepy and yawning:
         state = "Drowsy + Yawning"
@@ -1896,17 +2003,19 @@ def update_drowsy_status(frame, person_in_zone):
     elif yawning:
         state = "Yawning"
 
-    drowsy_last_state = state
+    runtime_state["drowsy_last_state"] = state
     if state == "Normal":
-        drowsy_last_alarm_state = None
+        runtime_state["drowsy_last_alarm_state"] = None
     return {"state": state, "ear": smooth_ear, "mar": smooth_mar, "has_face": True}
 
 
-def video_reader():
-    """在单独线程中读取视频帧"""
+def video_reader(profile=DETECTION_PROFILE_ZONE):
+    """在单独线程中读取视频帧（按档案独立读取）"""
     cap = None
     retry_count = 0
     max_retries = 5
+    read_fail_count = 0
+    max_consecutive_read_fails = 30
     current_video_path = None
 
     def get_capture_source(path):
@@ -1942,8 +2051,13 @@ def video_reader():
             # 使用 OpenCV FFmpeg 捕获参数增强 RTSP 抗抖动能力：
             # 1) 强制TCP，减少丢包；
             # 2) discardcorrupt：遇到损坏包时尽量跳过而非卡住；
-            # 3) 降低FFmpeg日志级别，避免大量解码告警刷屏。
-            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;discardcorrupt"
+            # 3) 限制重排序队列，降低 H.265 抖动时的延迟累积；
+            # 4) 增加超时参数，避免网络抖动导致长期阻塞；
+            # 5) 降低FFmpeg日志级别，避免大量解码告警刷屏。
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+                "rtsp_transport;tcp|fflags;discardcorrupt|"
+                "reorder_queue_size;0|max_delay;500000|stimeout;5000000"
+            )
             os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "16"  # error
             cap_ffmpeg = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
             if cap_ffmpeg.isOpened():
@@ -1957,11 +2071,13 @@ def video_reader():
     while not stop_flag.is_set():
         # 检查视频路径是否改变
         with video_lock:
-            if current_video_path != video_path:
+            target_video_cfg = video_profile_config.get(profile, {})
+            target_video_path = target_video_cfg.get("video_url", video_path)
+            if current_video_path != target_video_path:
                 if cap is not None:
                     cap.release()
                     cap = None
-                current_video_path = video_path
+                current_video_path = target_video_path
         
         if cap is None or not cap.isOpened():
             backend_logger.info(f"正在连接视频流: {current_video_path}")
@@ -1979,72 +2095,116 @@ def video_reader():
                 continue
             else:
                 retry_count = 0
+                read_fail_count = 0
                 # 获取视频分辨率
                 width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                 height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                 fps = cap.get(cv2.CAP_PROP_FPS)
-                video_info['width'] = width
-                video_info['height'] = height
-                video_info['fps'] = fps if fps > 0 else 0.0
+                if profile == DETECTION_PROFILE_ZONE:
+                    video_info['width'] = width
+                    video_info['height'] = height
+                    video_info['fps'] = fps if fps > 0 else 0.0
                 backend_logger.info(f"视频流连接成功 - 分辨率: {width}x{height}, FPS: {fps:.2f}")
         
         success, frame = cap.read()
         if not success:
-            backend_logger.warning("读取视频帧失败，尝试重新连接...")
+            read_fail_count += 1
+            if read_fail_count < max_consecutive_read_fails:
+                # H.265/RTSP 场景下单次读帧失败比较常见，先容忍短暂失败，避免频繁重连
+                time.sleep(0.03)
+                continue
+            backend_logger.warning(f"连续读取视频帧失败 {read_fail_count} 次，尝试重新连接...")
+            read_fail_count = 0
             cap.release()
             cap = None
-            time.sleep(1)
+            time.sleep(0.5)
             continue
+        read_fail_count = 0
         
         # 只保留最新帧
-        if not frame_queue.empty():
+        target_queue = profile_frame_queues.get(profile, frame_queue)
+        if not target_queue.empty():
             try:
-                frame_queue.get_nowait()
+                target_queue.get_nowait()
             except queue.Empty:
                 pass
         
         try:
-            frame_queue.put(frame, block=False)
+            target_queue.put(frame, block=False)
         except queue.Full:
             pass
+        if profile == DETECTION_PROFILE_ZONE:
+            # 兼容旧逻辑：主档案继续写入旧全局队列
+            if not frame_queue.empty():
+                try:
+                    frame_queue.get_nowait()
+                except queue.Empty:
+                    pass
+            try:
+                frame_queue.put(frame, block=False)
+            except queue.Full:
+                pass
     
     if cap is not None:
         cap.release()
     backend_logger.info("视频读取线程已停止")
 
 
-def detection_worker():
-    """检测工作线程"""
+def detection_worker(profile=DETECTION_PROFILE_ZONE):
+    """检测工作线程（按档案独立运行）"""
     global latest_frame, latest_results, latest_annotated_frame, zones, fps_counter, display_config, zone_has_people_mqtt_sent, inference_running, offpost_last_seen_person_ts, offpost_absence_alarm_sent, offpost_recovery_candidate_ts, inference_running_profiles, drowsy_last_state, detection_processed_frames
     
     while not stop_flag.is_set():
         try:
             # 从队列获取最新帧
             got_new_frame = False
+            active_profile = profile
+            active_queue = profile_frame_queues.get(active_profile, frame_queue)
+            runtime_state = profile_runtime_states.setdefault(active_profile, _build_profile_runtime_state())
+            runtime_cfg = profile_runtime_configs.setdefault(active_profile, {"zones": [], "alarm": {}})
+            zones_cfg = runtime_cfg.get("zones") or []
+            alarm_cfg = runtime_cfg.get("alarm") or alarm_config
+            fps_counter_local = profile_fps_counters.setdefault(active_profile, {"frame_count": 0, "last_time": time.time(), "current_fps": 0.0})
             try:
-                frame = frame_queue.get(timeout=1)
+                frame = active_queue.get(timeout=1)
                 got_new_frame = True  # 成功从队列获取新帧
             except queue.Empty:
                 # 如果没有新帧，使用上一帧（如果有）
-                if latest_frame is not None:
+                runtime_latest = profile_runtime_frames.get(active_profile, {}).get("latest_frame")
+                if runtime_latest is not None:
+                    frame = runtime_latest.copy()
+                    got_new_frame = False  # 这是重复帧，不计数
+                elif active_profile == DETECTION_PROFILE_ZONE and latest_frame is not None:
                     frame = latest_frame.copy()
                     got_new_frame = False  # 这是重复帧，不计数
                 else:
                     time.sleep(0.1)
                     continue
             
-            latest_frame = frame.copy()
+            if active_profile == DETECTION_PROFILE_ZONE:
+                latest_frame = frame.copy()
+            profile_runtime_frames.setdefault(active_profile, {})
+            profile_runtime_frames[active_profile]["latest_frame"] = frame.copy()
 
             with inference_state_lock:
-                running = bool(inference_running_profiles.get(current_detection_profile, False))
-            if not running:
-                latest_results = None
-                latest_annotated_frame = frame.copy()
+                profile_running = bool(inference_running_profiles.get(active_profile, False))
+                display_profile = current_detection_profile
+            emit_realtime_frame = (active_profile == display_profile)
+            zone_profile_running = profile_running and active_profile == DETECTION_PROFILE_ZONE
+            offpost_profile_running = profile_running and active_profile == DETECTION_PROFILE_OFFPOST
+            drowsy_profile_running = profile_running and active_profile == DETECTION_PROFILE_DROWSY
+            if not profile_running:
+                if active_profile == DETECTION_PROFILE_ZONE:
+                    latest_results = None
+                    latest_annotated_frame = frame.copy()
+                if not emit_realtime_frame:
+                    time.sleep(0.08)
+                    continue
                 _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
                 frame_base64 = base64.b64encode(buffer).decode('utf-8')
                 detection_data = {
                     "frame": f"data:image/jpeg;base64,{frame_base64}",
-                    "zones": zones,
+                    "zones": zones_cfg,
                     "detections": [],
                     "fps": 0.0,
                     "resolution": {
@@ -2052,44 +2212,50 @@ def detection_worker():
                         "height": video_info["height"]
                     }
                 }
+                detection_data["profile"] = active_profile
                 socketio.emit('frame', detection_data)
                 time.sleep(0.05)
                 continue
 
             # 仅在“区域报警”档案下保留跨帧跟踪；其它档案用普通检测，避免长期累计跟踪状态
             try:
+                active_model = models_by_profile.get(active_profile)
+                if active_model is None:
+                    load_model(active_profile)
+                    active_model = models_by_profile.get(active_profile)
+                if active_model is None:
+                    time.sleep(0.1)
+                    continue
                 with model_lock:
-                    if model is None:
-                        time.sleep(0.1)
-                        continue
-                    if current_detection_profile == DETECTION_PROFILE_ZONE:
-                        infer_outputs = model.track(
+                    if zone_profile_running:
+                        infer_outputs = active_model.track(
                             frame,
                             persist=True,
                             stream=False,
                             device=device,
                             classes=[0],
-                            imgsz=yolo_imgsz,
+                            imgsz=int(model_profile_config.get(active_profile, {}).get("imgsz", yolo_imgsz)),
                             verbose=False
                         )
                     else:
-                        infer_outputs = model.predict(
+                        infer_outputs = active_model.predict(
                             frame,
                             stream=False,
                             device=device,
                             classes=[0],
-                            imgsz=yolo_imgsz,
+                            imgsz=int(model_profile_config.get(active_profile, {}).get("imgsz", yolo_imgsz)),
                             verbose=False
                         )
                     results = infer_outputs[0] if isinstance(infer_outputs, (list, tuple)) else infer_outputs
-                latest_results = results
+                if active_profile == DETECTION_PROFILE_ZONE:
+                    latest_results = results
             except Exception as e:
                 yolo_logger.error(f"YOLO检测错误: {e}")
                 time.sleep(0.1)
                 continue
             
             # 检测对象是否进入任何启用的区域
-            enabled_zones = [z for z in zones if z.get('enabled', True) and len(z.get('points', [])) >= 3]
+            enabled_zones = [z for z in zones_cfg if z.get('enabled', True) and len(z.get('points', [])) >= 3]
             no_zone_mode = len(enabled_zones) == 0  # 未配置区域时，默认全画面检测
             person_in_zone_this_frame = False
             drowsy_status = {"state": "Normal", "ear": 0.0, "mar": 0.0, "has_face": False}
@@ -2118,7 +2284,7 @@ def detection_worker():
                                 if no_zone_mode:
                                     in_zone = True
                                 else:
-                                    detection_mode = alarm_config.get('detection_mode', 'center')
+                                    detection_mode = alarm_cfg.get('detection_mode', 'center')
                                     for zone in enabled_zones:
                                         zone_points = zone.get('points', [])
                                         if len(zone_points) < 3:
@@ -2136,47 +2302,47 @@ def detection_worker():
                                 
                                 if in_zone:
                                     person_in_zone_this_frame = True
-                                    if current_detection_profile not in (DETECTION_PROFILE_OFFPOST, DETECTION_PROFILE_DROWSY):
+                                    if zone_profile_running:
                                         track_id = int(track_ids[i]) if track_ids is not None and i < len(track_ids) else -1
                                         class_name_cn = get_class_name_cn(cls_id)
-                                        trigger_alarm(track_id, bbox_center, zone_id, zone_name, cls_id, class_name_cn)
+                                        trigger_alarm(track_id, bbox_center, zone_id, zone_name, cls_id, class_name_cn, profile=active_profile)
                                     if not no_zone_mode:
                                         break  # 区域模式下只对第一个匹配的区域报警
-                if current_detection_profile == DETECTION_PROFILE_OFFPOST:
+                if offpost_profile_running:
                     current_ts = time.time()
                     target_zone_name = enabled_zones[0].get('name', '当前区域') if enabled_zones else '当前区域'
                     if person_in_zone_this_frame:
-                        if offpost_absence_alarm_sent:
+                        if runtime_state["offpost_absence_alarm_sent"]:
                             # 进入回岗确认阶段：需连续检测到人达到阈值，才认为真正回岗（防抖）
-                            if offpost_recovery_candidate_ts is None:
-                                offpost_recovery_candidate_ts = current_ts
-                            recovery_confirm_duration = float(alarm_config.get('offpost_recovery_duration', 2.0))
-                            if current_ts - offpost_recovery_candidate_ts >= recovery_confirm_duration:
-                                recovery_absence_duration = offpost_recovery_candidate_ts - offpost_last_seen_person_ts
-                                trigger_offpost_recovery_alarm(recovery_absence_duration, target_zone_name)
-                                offpost_last_seen_person_ts = current_ts
-                                offpost_absence_alarm_sent = False
-                                offpost_recovery_candidate_ts = None
+                            if runtime_state["offpost_recovery_candidate_ts"] is None:
+                                runtime_state["offpost_recovery_candidate_ts"] = current_ts
+                            recovery_confirm_duration = float(alarm_cfg.get('offpost_recovery_duration', 2.0))
+                            if current_ts - runtime_state["offpost_recovery_candidate_ts"] >= recovery_confirm_duration:
+                                recovery_absence_duration = runtime_state["offpost_recovery_candidate_ts"] - runtime_state["offpost_last_seen_person_ts"]
+                                trigger_offpost_recovery_alarm(recovery_absence_duration, target_zone_name, profile=active_profile)
+                                runtime_state["offpost_last_seen_person_ts"] = current_ts
+                                runtime_state["offpost_absence_alarm_sent"] = False
+                                runtime_state["offpost_recovery_candidate_ts"] = None
                         else:
-                            offpost_last_seen_person_ts = current_ts
-                            offpost_recovery_candidate_ts = None
-                        if not zone_has_people_mqtt_sent:
+                            runtime_state["offpost_last_seen_person_ts"] = current_ts
+                            runtime_state["offpost_recovery_candidate_ts"] = None
+                        if not runtime_state["zone_has_people_mqtt_sent"]:
                             send_mqtt_message({"hasPeople": 1})
-                            zone_has_people_mqtt_sent = True
+                            runtime_state["zone_has_people_mqtt_sent"] = True
                     else:
-                        offpost_recovery_candidate_ts = None
-                        absence_duration = current_ts - offpost_last_seen_person_ts
-                        threshold = float(alarm_config.get('offpost_absence_duration', 10.0))
+                        runtime_state["offpost_recovery_candidate_ts"] = None
+                        absence_duration = current_ts - runtime_state["offpost_last_seen_person_ts"]
+                        threshold = float(alarm_cfg.get('offpost_absence_duration', 10.0))
                         if absence_duration >= threshold:
-                            trigger_offpost_absence_alarm(absence_duration, target_zone_name)
+                            trigger_offpost_absence_alarm(absence_duration, target_zone_name, profile=active_profile)
                 else:
                     # 本帧无人进入任何区域且此前已发送过 hasPeople:1 时，发送恢复消息
-                    if not person_in_zone_this_frame and zone_has_people_mqtt_sent:
+                    if not person_in_zone_this_frame and runtime_state["zone_has_people_mqtt_sent"]:
                         send_mqtt_message({"hasPeople": 0})
-                        zone_has_people_mqtt_sent = False
+                        runtime_state["zone_has_people_mqtt_sent"] = False
 
-                if current_detection_profile == DETECTION_PROFILE_DROWSY:
-                    drowsy_status = update_drowsy_status(frame, person_in_zone_this_frame)
+                if drowsy_profile_running:
+                    drowsy_status = update_drowsy_status(frame, person_in_zone_this_frame, profile=active_profile)
                     drowsy_state = drowsy_status.get("state", "Normal")
                     if drowsy_state in ("Drowsy", "Yawning", "Drowsy + Yawning"):
                         target_zone_name = enabled_zones[0].get('name', '当前区域') if enabled_zones else '当前区域'
@@ -2184,7 +2350,8 @@ def detection_worker():
                             drowsy_state,
                             drowsy_status.get("ear", 0.0),
                             drowsy_status.get("mar", 0.0),
-                            target_zone_name
+                            target_zone_name,
+                            profile=active_profile
                         )
             
             # 手动绘制检测框（只显示启用的类别）
@@ -2194,10 +2361,7 @@ def detection_worker():
                 boxes = results.boxes
                 track_ids = results.boxes.id
                 # 离岗/瞌睡监测画面不显示跟踪 ID
-                hide_track_id_on_video = current_detection_profile in (
-                    DETECTION_PROFILE_OFFPOST,
-                    DETECTION_PROFILE_DROWSY,
-                )
+                hide_track_id_on_video = (offpost_profile_running or drowsy_profile_running) and not zone_profile_running
                 
                 for i, box in enumerate(boxes):
                     if not _box_has_valid_data(box):
@@ -2215,11 +2379,11 @@ def detection_worker():
                             
                             # 判断是否在任何一个启用的报警区域内
                             in_zone = False
-                            enabled_zones = [z for z in zones if z.get('enabled', True) and len(z.get('points', [])) >= 3]
+                            enabled_zones = [z for z in zones_cfg if z.get('enabled', True) and len(z.get('points', [])) >= 3]
                             if not enabled_zones:
                                 in_zone = True  # 无区域时全画面视为在区
                             elif enabled_zones:
-                                detection_mode = alarm_config.get('detection_mode', 'center')
+                                detection_mode = alarm_cfg.get('detection_mode', 'center')
                                 for zone in enabled_zones:
                                     zone_points = zone.get('points', [])
                                     if len(zone_points) < 3:
@@ -2308,7 +2472,7 @@ def detection_worker():
                                            cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_color_bgr, 2)
             
             # 绘制所有启用的区域
-            enabled_zones = [z for z in zones if z.get('enabled', True) and len(z.get('points', [])) >= 3]
+            enabled_zones = [z for z in zones_cfg if z.get('enabled', True) and len(z.get('points', [])) >= 3]
             for zone in enabled_zones:
                 zone_points = zone.get('points', [])
                 if len(zone_points) < 3:
@@ -2381,7 +2545,7 @@ def detection_worker():
                     annotated_frame = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
             
             # 保存处理后的帧（用于MJPEG流）
-            if current_detection_profile == DETECTION_PROFILE_DROWSY:
+            if drowsy_profile_running:
                 status_text = drowsy_status.get("state", "Normal")
                 cv2.putText(
                     annotated_frame,
@@ -2401,8 +2565,18 @@ def detection_worker():
                     (255, 255, 255),
                     2
                 )
-            latest_annotated_frame = annotated_frame.copy()
-            _update_event_frame_buffer(latest_annotated_frame)
+            if active_profile == DETECTION_PROFILE_ZONE:
+                latest_annotated_frame = annotated_frame.copy()
+                _update_event_frame_buffer(latest_annotated_frame, active_profile, alarm_cfg)
+            profile_runtime_frames.setdefault(active_profile, {})
+            profile_runtime_frames[active_profile]["latest_annotated_frame"] = annotated_frame.copy()
+            if active_profile != DETECTION_PROFILE_ZONE:
+                _update_event_frame_buffer(annotated_frame, active_profile, alarm_cfg)
+            if not emit_realtime_frame:
+                detection_processed_frames += 1
+                if detection_processed_frames % DETECTION_GC_INTERVAL_FRAMES == 0:
+                    gc.collect()
+                continue
             
             # 编码为JPEG
             _, buffer = cv2.imencode('.jpg', annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
@@ -2410,21 +2584,21 @@ def detection_worker():
             
             # 计算帧率（只计算新帧，不计算重复帧）
             if got_new_frame:
-                fps_counter["frame_count"] += 1
+                fps_counter_local["frame_count"] += 1
                 current_time = time.time()
-                elapsed = current_time - fps_counter["last_time"]
+                elapsed = current_time - fps_counter_local["last_time"]
                 if elapsed >= 1.0:  # 每秒更新一次帧率
-                    fps_counter["current_fps"] = fps_counter["frame_count"] / elapsed
-                    fps_counter["frame_count"] = 0
-                    fps_counter["last_time"] = current_time
+                    fps_counter_local["current_fps"] = fps_counter_local["frame_count"] / elapsed
+                    fps_counter_local["frame_count"] = 0
+                    fps_counter_local["last_time"] = current_time
             
             # 准备检测数据
             detection_data = {
                 "frame": f"data:image/jpeg;base64,{frame_base64}",
-                "zones": zones,  # 发送所有区域（包括禁用的）
+                "zones": zones_cfg,  # 发送所有区域（包括禁用的）
                 "detections": [],
-                "fps": round(fps_counter["current_fps"], 2),
-                "drowsy": drowsy_status if current_detection_profile == DETECTION_PROFILE_DROWSY else None,
+                "fps": round(fps_counter_local["current_fps"], 2),
+                "drowsy": drowsy_status if drowsy_profile_running else None,
                 "resolution": {
                     "width": video_info["width"],
                     "height": video_info["height"]
@@ -2453,12 +2627,12 @@ def detection_worker():
                             # 检查是否在任何一个启用的区域内
                             in_zone = False
                             zone_id = None
-                            enabled_zones = [z for z in zones if z.get('enabled', True) and len(z.get('points', [])) >= 3]
+                            enabled_zones = [z for z in zones_cfg if z.get('enabled', True) and len(z.get('points', [])) >= 3]
                             if not enabled_zones:
                                 in_zone = True
                                 zone_id = 'full_frame'
                             elif enabled_zones:
-                                detection_mode = alarm_config.get('detection_mode', 'center')
+                                detection_mode = alarm_cfg.get('detection_mode', 'center')
                                 for zone in enabled_zones:
                                     zone_points = zone.get('points', [])
                                     if len(zone_points) < 3:
@@ -2487,6 +2661,7 @@ def detection_worker():
                             })
             
             # 通过WebSocket发送给所有连接的客户端
+            detection_data["profile"] = active_profile
             socketio.emit('frame', detection_data)
 
             detection_processed_frames += 1
@@ -2507,13 +2682,19 @@ def detection_worker():
             time.sleep(0.1)
 
 
-# 启动视频读取线程
-reader_thread = threading.Thread(target=video_reader, daemon=True)
-reader_thread.start()
+# 启动视频读取线程（每个档案独立读取）
+reader_threads = {}
+for _profile_key in (DETECTION_PROFILE_ZONE, DETECTION_PROFILE_OFFPOST, DETECTION_PROFILE_DROWSY):
+    thread = threading.Thread(target=video_reader, args=(_profile_key,), daemon=True)
+    thread.start()
+    reader_threads[_profile_key] = thread
 
-# 启动检测线程
-detection_thread = threading.Thread(target=detection_worker, daemon=True)
-detection_thread.start()
+# 启动检测线程（每个档案独立推理）
+detection_threads = {}
+for _profile_key in (DETECTION_PROFILE_ZONE, DETECTION_PROFILE_OFFPOST, DETECTION_PROFILE_DROWSY):
+    thread = threading.Thread(target=detection_worker, args=(_profile_key,), daemon=True)
+    thread.start()
+    detection_threads[_profile_key] = thread
 
 # 启动摄像头状态检测线程
 camera_status_thread = threading.Thread(target=camera_status_checker, daemon=True)
@@ -2523,15 +2704,20 @@ camera_status_thread.start()
 occlusion_detector_thread = threading.Thread(target=occlusion_detector, daemon=True)
 occlusion_detector_thread.start()
 # MJPEG视频流生成器（不经过YOLO处理）
-def generate_raw_video_stream():
+def generate_raw_video_stream(profile=None):
     """生成原始RTSP视频流的MJPEG流"""
     global latest_frame
     
     while not stop_flag.is_set():
         try:
             # 获取最新帧
-            if latest_frame is not None:
-                frame = latest_frame.copy()
+            runtime_frame = None
+            if profile in profile_runtime_frames:
+                runtime_frame = profile_runtime_frames[profile].get("latest_frame")
+            if runtime_frame is None:
+                runtime_frame = latest_frame
+            if runtime_frame is not None:
+                frame = runtime_frame.copy()
                 
                 # 编码为JPEG
                 success, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
@@ -2550,7 +2736,7 @@ def generate_raw_video_stream():
 
 
 # MJPEG视频流生成器（经过YOLO处理）
-def generate_processed_video_stream():
+def generate_processed_video_stream(profile=None):
     """生成经过YOLO处理的视频流的MJPEG流"""
     global latest_annotated_frame, latest_frame
     
@@ -2558,7 +2744,16 @@ def generate_processed_video_stream():
         try:
             # 优先发送处理帧；切换瞬间若无处理帧则回退原始帧，避免黑屏
             frame = None
-            if latest_annotated_frame is not None:
+            runtime_annotated = None
+            runtime_raw = None
+            if profile in profile_runtime_frames:
+                runtime_annotated = profile_runtime_frames[profile].get("latest_annotated_frame")
+                runtime_raw = profile_runtime_frames[profile].get("latest_frame")
+            if runtime_annotated is not None:
+                frame = runtime_annotated.copy()
+            elif runtime_raw is not None:
+                frame = runtime_raw.copy()
+            elif latest_annotated_frame is not None:
                 frame = latest_annotated_frame.copy()
             elif latest_frame is not None:
                 frame = latest_frame.copy()
@@ -2611,9 +2806,13 @@ def load_zones_config(profile=None):
                     max_id = max([int(z.get('id', '0').split('_')[-1]) if z.get('id', '').startswith('zone_') else 0 for z in zones], default=0)
                     next_zone_id = max_id + 1
                 backend_logger.info(f"已从 {zones_file} 加载 {len(zones)} 个区域")
+                profile_runtime_configs.setdefault(profile, {})
+                profile_runtime_configs[profile]["zones"] = copy.deepcopy(zones)
                 return True
         except Exception as e:
             backend_logger.error(f"加载区域配置文件失败: {e}")
+    profile_runtime_configs.setdefault(profile, {})
+    profile_runtime_configs[profile]["zones"] = copy.deepcopy(zones)
     return False
 
 
@@ -2652,6 +2851,19 @@ def ensure_detection_profile(profile, force=False):
     apply_video_profile(profile)
     load_zones_config(profile)
     load_alarm_config(profile)
+    runtime_state = profile_runtime_states.setdefault(profile, _build_profile_runtime_state())
+    runtime_state["alarm_triggered"].clear()
+    runtime_state["zone_has_people_mqtt_sent"] = False
+    runtime_state["offpost_last_seen_person_ts"] = time.time()
+    runtime_state["offpost_absence_alarm_sent"] = False
+    runtime_state["offpost_recovery_candidate_ts"] = None
+    runtime_state["drowsy_eye_low_frames"] = 0
+    runtime_state["drowsy_yawn_high_frames"] = 0
+    runtime_state["drowsy_ear_hist"].clear()
+    runtime_state["drowsy_mar_hist"].clear()
+    runtime_state["drowsy_last_state"] = "Normal"
+    runtime_state["drowsy_last_alarm_state"] = None
+    # 兼容旧全局状态（逐步迁移过程中保留）
     alarm_triggered.clear()
     zone_has_people_mqtt_sent = False
     offpost_last_seen_person_ts = time.time()
@@ -2680,8 +2892,13 @@ def get_profile_from_request_path(path):
     return DETECTION_PROFILE_ZONE
 
 
-# 加载已保存的区域配置
-load_zones_config()
+# 加载已保存的区域配置（并预加载各档案运行时配置）
+for _profile_key in (DETECTION_PROFILE_ZONE, DETECTION_PROFILE_OFFPOST, DETECTION_PROFILE_DROWSY):
+    load_zones_config(_profile_key)
+    load_alarm_config(_profile_key)
+# 恢复当前档案对应的全局兼容配置
+load_zones_config(current_detection_profile)
+load_alarm_config(current_detection_profile)
 
 # 录制配置管理
 def load_recording_config():
@@ -3094,8 +3311,8 @@ def start_inference_api():
             ensure_detection_profile(profile, force=True)
             return jsonify({"success": True, "message": "当前模式推理已在运行，已切换到该模式", "profile": profile})
         ensure_detection_profile(profile, force=True)
-        if model is None:
-            load_model()
+        if models_by_profile.get(profile) is None:
+            load_model(profile)
         with inference_state_lock:
             inference_running_profiles[profile] = True
             inference_running = any(inference_running_profiles.values())
@@ -3120,8 +3337,11 @@ def stop_inference_api():
         inference_running = any(inference_running_profiles.values())
 
     # 停止时如果此前发送过 hasPeople=1，则补发恢复消息
-    if profile == current_detection_profile and zone_has_people_mqtt_sent:
+    runtime_state = profile_runtime_states.setdefault(profile, _build_profile_runtime_state())
+    if runtime_state.get("zone_has_people_mqtt_sent", False):
         send_mqtt_message({"hasPeople": 0})
+        runtime_state["zone_has_people_mqtt_sent"] = False
+    if profile == current_detection_profile and zone_has_people_mqtt_sent:
         zone_has_people_mqtt_sent = False
 
     return jsonify({"success": True, "message": "推理已停止", "profile": profile})
@@ -3280,7 +3500,10 @@ def set_model():
         if profile == current_detection_profile:
             current_model_name = model_name
             yolo_imgsz = model_profile_config[profile]["imgsz"]
-            load_model()
+            load_model(profile)
+        else:
+            # 非当前档案也预加载模型，确保独立推理档案切换时不互相覆盖
+            load_model(profile)
         model_profile_config[profile]["model"] = current_model_name
         if profile != current_detection_profile:
             model_profile_config[profile]["model"] = model_name
@@ -3650,6 +3873,19 @@ def clear_alarm_mqtt():
         offpost_absence_alarm_sent = False
         offpost_last_seen_person_ts = time.time()
         offpost_recovery_candidate_ts = None
+        for profile in (DETECTION_PROFILE_ZONE, DETECTION_PROFILE_OFFPOST, DETECTION_PROFILE_DROWSY):
+            runtime_state = profile_runtime_states.setdefault(profile, _build_profile_runtime_state())
+            runtime_state["alarm_triggered"].clear()
+            runtime_state["zone_has_people_mqtt_sent"] = False
+            runtime_state["offpost_absence_alarm_sent"] = False
+            runtime_state["offpost_last_seen_person_ts"] = time.time()
+            runtime_state["offpost_recovery_candidate_ts"] = None
+            runtime_state["drowsy_eye_low_frames"] = 0
+            runtime_state["drowsy_yawn_high_frames"] = 0
+            runtime_state["drowsy_ear_hist"].clear()
+            runtime_state["drowsy_mar_hist"].clear()
+            runtime_state["drowsy_last_state"] = "Normal"
+            runtime_state["drowsy_last_alarm_state"] = None
         # 通知所有前端客户端清空当前报警列表
         socketio.emit('alarm_cleared', {'time': datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
         return jsonify({"success": True, "message": "报警记录已清除"})
@@ -3926,10 +4162,13 @@ def handle_disconnect():
 
 
 @app.route('/api/video/stream')
+@app.route('/api/offpost/video/stream')
+@app.route('/api/drowsy/video/stream')
 def video_stream():
     """原始RTSP视频流（MJPEG格式，不经过YOLO处理）"""
+    profile = get_profile_from_request_path(request.path)
     return Response(
-        generate_raw_video_stream(),
+        generate_raw_video_stream(profile),
         mimetype='multipart/x-mixed-replace; boundary=frame'
     )
 
@@ -3939,8 +4178,9 @@ def video_stream():
 @app.route('/api/drowsy/video/processed_stream')
 def processed_video_stream():
     """经过YOLO处理的视频流（MJPEG格式，包含检测框和区域）"""
+    profile = get_profile_from_request_path(request.path)
     return Response(
-        generate_processed_video_stream(),
+        generate_processed_video_stream(profile),
         mimetype='multipart/x-mixed-replace; boundary=frame'
     )
 
@@ -4282,6 +4522,8 @@ def set_alarm_config():
             # 如果启用"相同ID只报警一次"，清空之前的报警记录
             if once_per_id:
                 alarm_triggered.clear()
+                runtime_state = profile_runtime_states.setdefault(profile, _build_profile_runtime_state())
+                runtime_state["alarm_triggered"].clear()
 
         if 'popup_alarm_enabled' in data:
             alarm_config['popup_alarm_enabled'] = bool(data['popup_alarm_enabled'])
@@ -4313,8 +4555,10 @@ def set_alarm_config():
                 # 验证路径是否有效
                 try:
                     os.makedirs(event_path, exist_ok=True)
-                    os.makedirs(os.path.join(event_path, "videos"), exist_ok=True)
-                    os.makedirs(os.path.join(event_path, "images"), exist_ok=True)
+                    for event_type_dir in ("zone", "offpost", "drowsy"):
+                        os.makedirs(os.path.join(event_path, event_type_dir), exist_ok=True)
+                        os.makedirs(os.path.join(event_path, event_type_dir, "videos"), exist_ok=True)
+                        os.makedirs(os.path.join(event_path, event_type_dir, "images"), exist_ok=True)
                     alarm_config['event_save_path'] = event_path
                 except Exception as e:
                     return jsonify({"success": False, "message": f"保存路径无效: {str(e)}"}), 400
@@ -4347,6 +4591,9 @@ def set_alarm_config():
             alarm_config['drowsy_yawn_frames_threshold'] = yawn_frame_threshold
         
         save_alarm_config(profile)
+        # 并行推理运行时使用 profile_runtime_configs 中的报警配置，必须同步更新
+        profile_runtime_configs.setdefault(profile, {})
+        profile_runtime_configs[profile]["alarm"] = copy.deepcopy(alarm_config)
         return jsonify({
             "success": True,
             "message": "报警配置已更新",
