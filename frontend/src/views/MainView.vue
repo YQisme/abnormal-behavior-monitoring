@@ -227,6 +227,19 @@ const getModeKeyFromProfile = (profile) => {
   return 'zone'
 }
 
+const getProfileDisplayName = (profile) => {
+  if (profile === 'offpost_monitor') return '离岗监测'
+  if (profile === 'drowsy_monitor') return '瞌睡监测'
+  if (profile === 'zone_alarm') return '区域报警'
+  return '未知来源'
+}
+
+const getExpectedProfileFromRoute = () => {
+  if (route.path === '/leave-monitor') return 'offpost_monitor'
+  if (route.path === '/drowsy-monitor') return 'drowsy_monitor'
+  return 'zone_alarm'
+}
+
 const isInferenceBackendLog = (data) => {
   const message = String(data?.message || '').toLowerCase()
   if (!message) return false
@@ -309,6 +322,10 @@ onMounted(() => {
       console.warn('收到空的 frame 数据')
       return
     }
+    const expectedProfile = getExpectedProfileFromRoute()
+    if (data.profile && data.profile !== expectedProfile) {
+      return
+    }
     
     if (videoPanelRef.value) {
       videoPanelRef.value.updateFrame(data)
@@ -332,16 +349,12 @@ onMounted(() => {
   })
 
   socket.on('alarm', (data) => {
-    // 离岗监测模式下忽略“有人进入区域”的报警，只保留持续无人报警
-    if (isLeaveMonitorMode.value && (data?.alarm_type === 'zone' || !data?.alarm_type)) {
-      return
-    }
+    // 全局报警：无论当前在哪个监测页面，都响应所有运行档案发出的报警
     console.log('报警:', data)
     alarms.value.unshift(data)
     if (alarms.value.length > 20) {
       alarms.value.pop()
     }
-    runAlarmActions(data)
   })
   
   socket.on('alarm_cleared', () => {
@@ -435,19 +448,20 @@ const normalizeObjectName = (name) => {
 }
 
 const buildAlarmText = (alarm) => {
+  const sourceTag = `【${getProfileDisplayName(alarm?.profile)}】`
   const zoneName = alarm?.zone_name ? `${alarm.zone_name}` : ''
   if (alarm?.alarm_type === 'offpost_absence') {
     const duration = alarm?.absence_duration !== undefined ? `${Number(alarm.absence_duration).toFixed(1)}秒` : '持续无人'
-    return `${zoneName}已${duration}未检测到人员，疑似离岗`
+    return `${sourceTag}${zoneName}已${duration}未检测到人员，疑似离岗`
   }
   if (alarm?.alarm_type === 'offpost_recovery') {
     const duration = alarm?.absence_duration !== undefined ? `${Number(alarm.absence_duration).toFixed(1)}秒` : '一段时间'
-    return `${zoneName}已离岗${duration}`
+    return `${sourceTag}${zoneName}已离岗${duration}`
   }
   if (alarm?.alarm_type === 'drowsy') {
-    return `${zoneName}瞌睡报警，${toChineseDrowsyState(alarm?.drowsy_state)}`
+    return `${sourceTag}${zoneName}瞌睡报警，${toChineseDrowsyState(alarm?.drowsy_state)}`
   }
-  return `${normalizeObjectName(alarm?.class_name_cn || alarm?.object_name)}进入监控区域${zoneName}`
+  return `${sourceTag}${normalizeObjectName(alarm?.class_name_cn || alarm?.object_name)}进入监控区域${zoneName}`
 }
 
 const triggerFlashRed = (text, needManualConfirm, alarm = null) => {

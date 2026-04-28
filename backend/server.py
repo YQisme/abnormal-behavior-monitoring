@@ -220,6 +220,11 @@ inference_running_profiles = {
     DETECTION_PROFILE_OFFPOST: False,
     DETECTION_PROFILE_DROWSY: False
 }
+auto_start_inference_profiles = {
+    DETECTION_PROFILE_ZONE: False,
+    DETECTION_PROFILE_OFFPOST: False,
+    DETECTION_PROFILE_DROWSY: False
+}
 
 # 瞌睡检测（EAR/MAR）配置与状态
 DROWSY_DEFAULT_TASK_MODEL = "face_landmarker.task"
@@ -368,7 +373,7 @@ models_by_profile = {
     DETECTION_PROFILE_DROWSY: None,
 }
 inference_running = False  # 是否存在任一档案在运行（兼容旧状态字段）
-auto_start_inference = False  # 服务启动后是否自动开始推理
+auto_start_inference = False  # 当前档案服务启动后是否自动开始推理（兼容旧字段）
 inference_state_lock = threading.Lock()  # 推理状态锁
 
 # 多档案运行时帧缓存（兼容旧架构：先用于按档案读取视频帧，后续可扩展为独立线程/独立模型上下文）
@@ -540,7 +545,7 @@ def camera_status_checker():
 # 加载系统配置
 def load_system_config():
     """从配置文件加载系统配置"""
-    global current_model_name, yolo_imgsz, video_path, camera_ip, model, auto_start_inference, inference_running, inference_running_profiles
+    global current_model_name, yolo_imgsz, video_path, camera_ip, model, auto_start_inference, inference_running, inference_running_profiles, auto_start_inference_profiles
     if os.path.exists(config_file):
         try:
             with open(config_file, 'r') as f:
@@ -558,8 +563,15 @@ def load_system_config():
                     video_path = config['video_url']
                 if 'camera_ip' in config:
                     camera_ip = config['camera_ip']
-                if 'auto_start_inference' in config:
-                    auto_start_inference = bool(config['auto_start_inference'])
+                if 'auto_start_inference_profiles' in config and isinstance(config['auto_start_inference_profiles'], dict):
+                    for profile_key in (DETECTION_PROFILE_ZONE, DETECTION_PROFILE_OFFPOST, DETECTION_PROFILE_DROWSY):
+                        auto_start_inference_profiles[profile_key] = bool(config['auto_start_inference_profiles'].get(profile_key, False))
+                elif 'auto_start_inference' in config:
+                    # 兼容旧配置：仅保存了单个自动启动开关时，默认映射到区域报警档案
+                    legacy_auto_start = bool(config['auto_start_inference'])
+                    auto_start_inference_profiles[DETECTION_PROFILE_ZONE] = legacy_auto_start
+                    auto_start_inference_profiles[DETECTION_PROFILE_OFFPOST] = False
+                    auto_start_inference_profiles[DETECTION_PROFILE_DROWSY] = False
                 backend_logger.info(f"已从 {config_file} 加载系统配置")
         except Exception as e:
             backend_logger.error(f"加载系统配置文件失败: {e}")
@@ -572,12 +584,12 @@ def load_system_config():
             backend_logger.info(f"从RTSP URL中提取IP地址: {camera_ip}")
     
     # 根据配置决定是否自动启动推理
+    auto_start_inference = bool(auto_start_inference_profiles.get(current_detection_profile, False))
     with inference_state_lock:
         for profile_key in inference_running_profiles:
-            inference_running_profiles[profile_key] = False
-        inference_running_profiles[current_detection_profile] = auto_start_inference
+            inference_running_profiles[profile_key] = bool(auto_start_inference_profiles.get(profile_key, False))
         inference_running = any(inference_running_profiles.values())
-    if auto_start_inference:
+    if inference_running:
         load_model()
         backend_logger.info("服务启动后自动开始推理")
     else:
@@ -585,14 +597,19 @@ def load_system_config():
 
 def save_system_config():
     """保存系统配置到文件"""
-    global camera_ip, camera_check_interval, yolo_imgsz, auto_start_inference
+    global camera_ip, camera_check_interval, yolo_imgsz, auto_start_inference, auto_start_inference_profiles
     config = {
         "model": current_model_name,
         "imgsz": yolo_imgsz,
         "video_url": video_path,
         "camera_ip": camera_ip,
         "camera_check_interval": camera_check_interval,
-        "auto_start_inference": auto_start_inference
+        "auto_start_inference": auto_start_inference,
+        "auto_start_inference_profiles": {
+            DETECTION_PROFILE_ZONE: bool(auto_start_inference_profiles.get(DETECTION_PROFILE_ZONE, False)),
+            DETECTION_PROFILE_OFFPOST: bool(auto_start_inference_profiles.get(DETECTION_PROFILE_OFFPOST, False)),
+            DETECTION_PROFILE_DROWSY: bool(auto_start_inference_profiles.get(DETECTION_PROFILE_DROWSY, False))
+        }
     }
     try:
         with open(config_file, 'w') as f:
@@ -3258,12 +3275,13 @@ def rename_zone(zone_id):
 @app.route('/api/status', methods=['GET'])
 def get_status():
     """获取系统状态"""
-    global gpu_available, device, inference_running, auto_start_inference
+    global gpu_available, device, inference_running, auto_start_inference, auto_start_inference_profiles
     # 重新检测GPU状态
     gpu_available, device = check_gpu_available()
     
     enabled_zones_count = len([z for z in zones if z.get('enabled', True)])
     
+    auto_start_inference = bool(auto_start_inference_profiles.get(current_detection_profile, False))
     return jsonify({
         "video_connected": not frame_queue.empty() or latest_frame is not None,
         "zones_count": len(zones),
@@ -3282,16 +3300,18 @@ def get_status():
 @app.route('/api/drowsy/inference', methods=['GET'])
 def get_inference_status():
     """获取推理状态和自动启动配置"""
-    global inference_running, auto_start_inference, current_detection_profile, inference_running_profiles
+    global inference_running, auto_start_inference, current_detection_profile, inference_running_profiles, auto_start_inference_profiles
     profile = get_profile_from_request_path(request.path)
     with inference_state_lock:
         running = bool(inference_running_profiles.get(profile, False))
+    auto_start = bool(auto_start_inference_profiles.get(profile, False))
+    auto_start_inference = auto_start
     return jsonify({
         "running": running,
         "profile": profile,
         "active_profile": current_detection_profile,
         "any_running": inference_running,
-        "auto_start": auto_start_inference
+        "auto_start": auto_start
     })
 
 
@@ -3352,17 +3372,20 @@ def stop_inference_api():
 @app.route('/api/drowsy/inference/config', methods=['POST'])
 def set_inference_config():
     """设置推理自动启动配置"""
-    global auto_start_inference
+    global auto_start_inference, auto_start_inference_profiles
     data = request.json or {}
     if 'auto_start' not in data:
         return jsonify({"success": False, "message": "缺少参数 auto_start"}), 400
 
-    auto_start_inference = bool(data.get('auto_start'))
+    profile = get_profile_from_request_path(request.path)
+    auto_start_inference_profiles[profile] = bool(data.get('auto_start'))
+    auto_start_inference = bool(auto_start_inference_profiles.get(profile, False))
     save_system_config()
     return jsonify({
         "success": True,
         "message": "自动启动配置已更新",
-        "auto_start": auto_start_inference
+        "auto_start": auto_start_inference,
+        "profile": profile
     })
 
 

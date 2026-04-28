@@ -1,8 +1,13 @@
 {
   "model": "yolo11m.pt",
   "imgsz": 640,
-  "video_url": "rtsp://admin:scyzkj123456@192.168.0.64:554/h264/ch1/main/av_stream4",
+  "video_url": "rtsp://admin:scyzkj123456@192.168.0.2:554/h264/ch1/main/av_stream4",
   "camera_ip": "192.168.0.2",
   "camera_check_interval": 5,
-  "auto_start_inference": false
+  "auto_start_inference": true,
+  "auto_start_inference_profiles": {
+    "zone_alarm": false,
+    "offpost_monitor": true,
+    "drowsy_monitor": true
+  }
 }
