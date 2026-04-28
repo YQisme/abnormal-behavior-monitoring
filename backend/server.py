@@ -2193,6 +2193,11 @@ def detection_worker():
             if results.boxes is not None and len(results.boxes) > 0:
                 boxes = results.boxes
                 track_ids = results.boxes.id
+                # 离岗/瞌睡监测画面不显示跟踪 ID
+                hide_track_id_on_video = current_detection_profile in (
+                    DETECTION_PROFILE_OFFPOST,
+                    DETECTION_PROFILE_DROWSY,
+                )
                 
                 for i, box in enumerate(boxes):
                     if not _box_has_valid_data(box):
@@ -2245,11 +2250,13 @@ def detection_worker():
                             box_thickness = display_config['box_thickness']
                             cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), box_color, box_thickness)
                             
+                            id_suffix = "" if hide_track_id_on_video else f" ID:{track_id}"
+                            
                             # 获取类别名称并绘制文字
                             if display_config.get('use_chinese', True):
                                 # 使用中文显示
                                 class_name = get_class_name_cn(cls_id)
-                                label = f"{class_name} {conf:.2f} ID:{track_id}"
+                                label = f"{class_name} {conf:.2f}{id_suffix}"
                                 
                                 # 使用PIL绘制中文文字（OpenCV不支持中文）
                                 # 将OpenCV图像转换为PIL图像
@@ -2292,7 +2299,7 @@ def detection_worker():
                             else:
                                 # 使用英文显示（OpenCV原生，性能更好）
                                 class_name_en = model_classes[cls_id] if cls_id < len(model_classes) else f"class_{cls_id}"
-                                label = f"{class_name_en} {conf:.2f} ID:{track_id}"
+                                label = f"{class_name_en} {conf:.2f}{id_suffix}"
                                 
                                 # 使用OpenCV绘制文字（需要转换为BGR格式）
                                 text_color_bgr = (text_color_rgb[2], text_color_rgb[1], text_color_rgb[0])  # RGB转BGR
