@@ -227,6 +227,21 @@ const getModeKeyFromProfile = (profile) => {
   return 'zone'
 }
 
+const isInferenceBackendLog = (data) => {
+  const message = String(data?.message || '').toLowerCase()
+  if (!message) return false
+  // 兼容后端将推理相关信息写在 backend_logger 的情况
+  return [
+    'yolo',
+    'ultralytics',
+    '推理',
+    '检测',
+    'imgsz',
+    'model',
+    'track'
+  ].some((token) => message.includes(token))
+}
+
 const refreshPageMode = () => {
   isLeaveMonitorMode.value = route.path === '/leave-monitor'
   isDrowsyMonitorMode.value = route.path === '/drowsy-monitor'
@@ -338,6 +353,14 @@ onMounted(() => {
     const targetModeKey = getModeKeyFromProfile(data?.profile)
     const targetModeLogs = logsByMode.value[targetModeKey]
     const loggerName = String(data?.logger || '').toLowerCase()
+    if (loggerName === 'backend' && isInferenceBackendLog(data)) {
+      targetModeLogs.yolo.push(data)
+      if (targetModeLogs.yolo.length > 1000) {
+        targetModeLogs.yolo.shift()
+      }
+      return
+    }
+
     if (loggerName === 'backend') {
       targetModeLogs.backend.push(data)
       if (targetModeLogs.backend.length > 1000) {
