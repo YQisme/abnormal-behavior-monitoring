@@ -148,12 +148,19 @@ alarm_config = {
     "once_per_id": False,  # 相同ID是否只报警一次（True=整个生命周期只报警一次，False=允许重复报警）
     "popup_alarm_enabled": True,  # 是否开启弹窗报警
     "sound_light_alarm_enabled": True,  # 是否开启声光报警（通过MQTT下发）
+    "local_audio_alarm_enabled": True,  # 是否开启本地扬声器播报（后端直接调用 aplay）
+    "local_audio_volume": 80,  # 本地播报音量（0-100）
+    "local_audio_device": "hw:0,0",  # 本地扬声器 ALSA 设备
+    "local_audio_file_offpost": "offpost.mp3",  # audio目录下：离岗报警音频文件
+    "local_audio_file_drowsy": "drowsy.mp3",  # audio目录下：瞌睡报警音频文件
+    "local_audio_file_yawning": "yawning.mp3",  # audio目录下：打哈欠报警音频文件
+    "local_audio_file_drowsy_yawning": "drowsy_yawning.mp3",  # audio目录下：瞌睡+打哈欠报警音频文件
+    "local_audio_min_interval": 3.0,  # 本地播报最小间隔（秒）
     "save_event_video": True,  # 是否保存报警事件视频
     "save_event_image": True,  # 是否保存报警事件图片
     "event_video_duration": 10,  # 报警事件视频时长（秒）
     "event_save_path": os.path.join(BASE_DIR, "alarm_events")  # 报警事件保存路径
 }
-
 # 遮挡检测配置
 occlusion_config = {
     "enabled": False,  # 是否启用遮挡检测
@@ -215,6 +222,11 @@ DETECTION_PROFILE_FILES = {
     }
 }
 current_detection_profile = DETECTION_PROFILE_ZONE
+local_audio_alarm_last_ts = {
+    DETECTION_PROFILE_ZONE: 0.0,
+    DETECTION_PROFILE_OFFPOST: 0.0,
+    DETECTION_PROFILE_DROWSY: 0.0
+}
 inference_running_profiles = {
     DETECTION_PROFILE_ZONE: False,
     DETECTION_PROFILE_OFFPOST: False,
@@ -972,6 +984,14 @@ def load_alarm_config(profile=None):
         "once_per_id": False,
         "popup_alarm_enabled": True,
         "sound_light_alarm_enabled": True,
+        "local_audio_alarm_enabled": True,
+        "local_audio_volume": 80,
+        "local_audio_device": "hw:0,0",
+        "local_audio_file_offpost": "offpost.mp3",
+        "local_audio_file_drowsy": "drowsy.mp3",
+        "local_audio_file_yawning": "yawning.mp3",
+        "local_audio_file_drowsy_yawning": "drowsy_yawning.mp3",
+        "local_audio_min_interval": 3.0,
         "save_event_video": True,
         "save_event_image": True,
         "event_video_duration": 10,
@@ -1001,6 +1021,22 @@ def load_alarm_config(profile=None):
                     alarm_config['popup_alarm_enabled'] = bool(config['popup_alarm_enabled'])
                 if 'sound_light_alarm_enabled' in config:
                     alarm_config['sound_light_alarm_enabled'] = bool(config['sound_light_alarm_enabled'])
+                if 'local_audio_alarm_enabled' in config:
+                    alarm_config['local_audio_alarm_enabled'] = bool(config['local_audio_alarm_enabled'])
+                if 'local_audio_volume' in config:
+                    alarm_config['local_audio_volume'] = max(0, min(100, int(config['local_audio_volume'])))
+                if 'local_audio_device' in config:
+                    alarm_config['local_audio_device'] = str(config['local_audio_device']).strip() or "hw:0,0"
+                if 'local_audio_file_offpost' in config:
+                    alarm_config['local_audio_file_offpost'] = str(config['local_audio_file_offpost']).strip() or "offpost.mp3"
+                if 'local_audio_file_drowsy' in config:
+                    alarm_config['local_audio_file_drowsy'] = str(config['local_audio_file_drowsy']).strip() or "drowsy.mp3"
+                if 'local_audio_file_yawning' in config:
+                    alarm_config['local_audio_file_yawning'] = str(config['local_audio_file_yawning']).strip() or "yawning.mp3"
+                if 'local_audio_file_drowsy_yawning' in config:
+                    alarm_config['local_audio_file_drowsy_yawning'] = str(config['local_audio_file_drowsy_yawning']).strip() or "drowsy_yawning.mp3"
+                if 'local_audio_min_interval' in config:
+                    alarm_config['local_audio_min_interval'] = max(0.0, float(config['local_audio_min_interval']))
                 if 'save_event_video' in config:
                     alarm_config['save_event_video'] = bool(config['save_event_video'])
                 if 'save_event_image' in config:
@@ -1046,6 +1082,97 @@ def save_alarm_config(profile=None):
         backend_logger.info(f"报警配置已保存到 {alarm_file}")
     except Exception as e:
         backend_logger.error(f"保存报警配置失败: {e}")
+
+
+def _resolve_audio_path(file_name):
+    """将配置的音频文件名解析为绝对路径（优先 audio 目录）。"""
+    if not file_name:
+        return ""
+    candidate = str(file_name).strip()
+    if not candidate:
+        return ""
+    if os.path.isabs(candidate):
+        return candidate
+    return os.path.join(BASE_DIR, "audio", candidate)
+
+
+def build_drowsy_audio_file(state, alarm_cfg=None):
+    cfg = alarm_cfg or alarm_config
+    if state == "Drowsy + Yawning":
+        return _resolve_audio_path(cfg.get("local_audio_file_drowsy_yawning", "drowsy_yawning.mp3"))
+    if state == "Drowsy":
+        return _resolve_audio_path(cfg.get("local_audio_file_drowsy", "drowsy.mp3"))
+    return _resolve_audio_path(cfg.get("local_audio_file_yawning", "yawning.mp3"))
+
+
+def build_offpost_audio_file(alarm_cfg=None):
+    cfg = alarm_cfg or alarm_config
+    return _resolve_audio_path(cfg.get("local_audio_file_offpost", "offpost.mp3"))
+
+
+def play_local_alarm_audio(alarm_cfg=None, profile=None, audio_file=None):
+    """后端本地播报：mp3优先用 mpg123/ffplay，wav用 aplay。"""
+    cfg = alarm_cfg or alarm_config
+    target_profile = profile or current_detection_profile
+    if not cfg.get('local_audio_alarm_enabled', True):
+        return False
+
+    now = time.time()
+    min_interval = max(0.0, float(cfg.get('local_audio_min_interval', 3.0)))
+    last_ts = float(local_audio_alarm_last_ts.get(target_profile, 0.0))
+    if now - last_ts < min_interval:
+        return False
+
+    volume_percent = max(0, min(100, int(cfg.get('local_audio_volume', 80))))
+    audio_device = str(cfg.get('local_audio_device', 'hw:0,0')).strip() or "hw:0,0"
+    target_audio_file = _resolve_audio_path(audio_file)
+
+    if not target_audio_file or not os.path.exists(target_audio_file):
+        backend_logger.warning(f"本地音频文件不存在，跳过播报: {target_audio_file}")
+        return False
+    try:
+        if shutil.which('amixer') is not None:
+            try:
+                card_ref = audio_device.split(',')[0] if audio_device.startswith('hw:') else audio_device
+                subprocess.run(
+                    ['amixer', '-D', card_ref, 'sset', 'Master', f'{volume_percent}%'],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=2
+                )
+            except Exception:
+                pass
+
+        ext = os.path.splitext(target_audio_file)[1].lower()
+        play_cmd = None
+        if ext == '.mp3':
+            if shutil.which('mpg123') is not None:
+                play_cmd = ['mpg123', '-a', audio_device, target_audio_file]
+            elif shutil.which('ffplay') is not None:
+                # ffplay volume 取值 0-100
+                play_cmd = [
+                    'ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet',
+                    '-volume', str(volume_percent), target_audio_file
+                ]
+            else:
+                backend_logger.warning("未检测到 mpg123/ffplay，无法播放 mp3")
+                return False
+        else:
+            if shutil.which('aplay') is None:
+                backend_logger.warning("未检测到 aplay，无法执行本地扬声器播报")
+                return False
+            play_cmd = ['aplay', '-D', audio_device, target_audio_file]
+
+        subprocess.Popen(
+            play_cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        local_audio_alarm_last_ts[target_profile] = now
+        return True
+    except Exception as e:
+        backend_logger.error(f"本地扬声器播报失败: {e}")
+        return False
 
 # 遮挡检测配置管理
 def load_occlusion_config():
@@ -1777,6 +1904,11 @@ def trigger_offpost_absence_alarm(absence_duration, zone_name='当前区域', pr
     }
 
     socketio.emit('alarm', alarm_data)
+    play_local_alarm_audio(
+        alarm_cfg=alarm_cfg,
+        profile=profile,
+        audio_file=build_offpost_audio_file(alarm_cfg=alarm_cfg)
+    )
     backend_logger.warning(f"⚠️  离岗报警！区域【{zone_name}】已持续无人 {absence_duration:.2f} 秒，时间: {current_time}")
     runtime_state["offpost_absence_alarm_sent"] = True
     return True
@@ -1963,6 +2095,11 @@ def trigger_drowsy_alarm(state, ear_value, mar_value, zone_name="当前区域", 
         "mar": round(float(mar_value), 3)
     }
     socketio.emit('alarm', alarm_data)
+    play_local_alarm_audio(
+        alarm_cfg=alarm_cfg,
+        profile=profile,
+        audio_file=build_drowsy_audio_file(state, alarm_cfg=alarm_cfg)
+    )
     backend_logger.warning(
         f"⚠️  瞌睡报警！状态={state}, EAR={ear_value:.3f}, MAR={mar_value:.3f}, 区域={zone_name}, 时间={current_time}"
     )
@@ -4492,6 +4629,32 @@ def preview_recording_video(filename):
         return jsonify({"success": False, "message": f"获取预览失败: {str(e)}"}), 500
 
 
+@app.route('/api/audio/preview', methods=['GET'])
+def preview_audio_file():
+    """预览 audio 目录中的音频文件（供前端试听）。"""
+    try:
+        file_name = (request.args.get('file') or '').strip()
+        if not file_name:
+            return jsonify({"success": False, "message": "缺少 file 参数"}), 400
+
+        safe_name = os.path.basename(file_name)
+        if safe_name != file_name:
+            return jsonify({"success": False, "message": "非法文件名"}), 400
+
+        audio_dir = os.path.join(BASE_DIR, "audio")
+        abs_audio_dir = os.path.abspath(audio_dir)
+        abs_target = os.path.abspath(os.path.join(audio_dir, safe_name))
+        if not abs_target.startswith(abs_audio_dir + os.sep):
+            return jsonify({"success": False, "message": "非法文件路径"}), 400
+        if not os.path.isfile(abs_target):
+            return jsonify({"success": False, "message": f"音频文件不存在: {safe_name}"}), 404
+
+        return send_from_directory(audio_dir, safe_name, as_attachment=False)
+    except Exception as e:
+        backend_logger.error(f"音频试听失败: {e}")
+        return jsonify({"success": False, "message": f"试听失败: {str(e)}"}), 500
+
+
 @app.route('/api/alarm', methods=['GET'])
 @app.route('/api/offpost/alarm', methods=['GET'])
 @app.route('/api/drowsy/alarm', methods=['GET'])
@@ -4553,6 +4716,44 @@ def set_alarm_config():
 
         if 'sound_light_alarm_enabled' in data:
             alarm_config['sound_light_alarm_enabled'] = bool(data['sound_light_alarm_enabled'])
+
+        if 'local_audio_alarm_enabled' in data:
+            alarm_config['local_audio_alarm_enabled'] = bool(data['local_audio_alarm_enabled'])
+        if 'local_audio_volume' in data:
+            local_audio_volume = int(data['local_audio_volume'])
+            if local_audio_volume < 0 or local_audio_volume > 100:
+                return jsonify({"success": False, "message": "本地播报音量必须在0-100之间"}), 400
+            alarm_config['local_audio_volume'] = local_audio_volume
+
+        if 'local_audio_device' in data:
+            alarm_config['local_audio_device'] = str(data['local_audio_device']).strip() or "hw:0,0"
+
+        if 'local_audio_file_offpost' in data:
+            local_audio_file = str(data['local_audio_file_offpost']).strip()
+            if not local_audio_file:
+                return jsonify({"success": False, "message": "离岗音频文件不能为空"}), 400
+            alarm_config['local_audio_file_offpost'] = local_audio_file
+        if 'local_audio_file_drowsy' in data:
+            local_audio_file = str(data['local_audio_file_drowsy']).strip()
+            if not local_audio_file:
+                return jsonify({"success": False, "message": "瞌睡音频文件不能为空"}), 400
+            alarm_config['local_audio_file_drowsy'] = local_audio_file
+        if 'local_audio_file_yawning' in data:
+            local_audio_file = str(data['local_audio_file_yawning']).strip()
+            if not local_audio_file:
+                return jsonify({"success": False, "message": "打哈欠音频文件不能为空"}), 400
+            alarm_config['local_audio_file_yawning'] = local_audio_file
+        if 'local_audio_file_drowsy_yawning' in data:
+            local_audio_file = str(data['local_audio_file_drowsy_yawning']).strip()
+            if not local_audio_file:
+                return jsonify({"success": False, "message": "瞌睡+打哈欠音频文件不能为空"}), 400
+            alarm_config['local_audio_file_drowsy_yawning'] = local_audio_file
+
+        if 'local_audio_min_interval' in data:
+            local_audio_min_interval = float(data['local_audio_min_interval'])
+            if local_audio_min_interval < 0:
+                return jsonify({"success": False, "message": "本地播报间隔不能为负数"}), 400
+            alarm_config['local_audio_min_interval'] = local_audio_min_interval
         
         if 'save_event_video' in data:
             alarm_config['save_event_video'] = bool(data['save_event_video'])

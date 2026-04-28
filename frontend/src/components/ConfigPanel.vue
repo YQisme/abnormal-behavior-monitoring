@@ -511,6 +511,84 @@
               开启后执行声光报警动作（屏幕闪红并语音播报）
             </span>
           </el-form-item>
+          <el-form-item label="后端本地播报">
+            <el-switch v-model="alarmForm.local_audio_alarm_enabled" />
+            <span style="margin-left: 10px; color: #666; font-size: 12px">
+              开启后由后端直接调用 aplay，本地扬声器可在未打开网页时播报
+            </span>
+          </el-form-item>
+          <el-form-item label="本地播报音量（0-100）">
+            <el-slider
+              v-model="alarmForm.local_audio_volume"
+              :min="0"
+              :max="100"
+              :step="1"
+              show-input
+              style="max-width: 420px"
+            />
+          </el-form-item>
+          <el-form-item label="本地音频设备">
+            <el-input
+              v-model="alarmForm.local_audio_device"
+              placeholder="例如: hw:0,0"
+              style="width: 320px"
+            />
+            <span style="margin-left: 10px; color: #666; font-size: 12px">
+              ALSA 设备名，可用 aplay -l 查看
+            </span>
+          </el-form-item>
+          <el-form-item v-if="isDrowsyMode" label="瞌睡音频文件">
+            <el-input
+              v-model="alarmForm.local_audio_file_drowsy"
+              placeholder="例如: drowsy.mp3（位于项目 audio/ 目录）"
+            >
+              <template #append>
+                <el-button @click="previewAlarmAudio(alarmForm.local_audio_file_drowsy)">试听</el-button>
+              </template>
+            </el-input>
+          </el-form-item>
+          <el-form-item v-if="isDrowsyMode" label="打哈欠音频文件">
+            <el-input
+              v-model="alarmForm.local_audio_file_yawning"
+              placeholder="例如: yawning.mp3（位于项目 audio/ 目录）"
+            >
+              <template #append>
+                <el-button @click="previewAlarmAudio(alarmForm.local_audio_file_yawning)">试听</el-button>
+              </template>
+            </el-input>
+          </el-form-item>
+          <el-form-item v-if="isDrowsyMode" label="瞌睡+打哈欠音频文件">
+            <el-input
+              v-model="alarmForm.local_audio_file_drowsy_yawning"
+              placeholder="例如: drowsy_yawning.mp3（位于项目 audio/ 目录）"
+            >
+              <template #append>
+                <el-button @click="previewAlarmAudio(alarmForm.local_audio_file_drowsy_yawning)">试听</el-button>
+              </template>
+            </el-input>
+          </el-form-item>
+          <el-form-item v-if="isOffpostMode" label="离岗音频文件">
+            <el-input
+              v-model="alarmForm.local_audio_file_offpost"
+              placeholder="例如: offpost.mp3（位于项目 audio/ 目录）"
+            >
+              <template #append>
+                <el-button @click="previewAlarmAudio(alarmForm.local_audio_file_offpost)">试听</el-button>
+              </template>
+            </el-input>
+          </el-form-item>
+          <el-form-item label="本地播报最小间隔（秒）">
+            <el-input-number
+              v-model="alarmForm.local_audio_min_interval"
+              :min="0"
+              :max="300"
+              :step="0.5"
+              :precision="1"
+            />
+            <span style="margin-left: 10px; color: #666; font-size: 12px">
+              防止报警连续触发导致重复播音
+            </span>
+          </el-form-item>
           
           <el-divider>事件保存设置</el-divider>
           
@@ -650,6 +728,14 @@ const alarmForm = ref({
   once_per_id: false,
   popup_alarm_enabled: true,
   sound_light_alarm_enabled: true,
+  local_audio_alarm_enabled: true,
+  local_audio_volume: 80,
+  local_audio_device: 'hw:0,0',
+  local_audio_file_offpost: 'offpost.mp3',
+  local_audio_file_drowsy: 'drowsy.mp3',
+  local_audio_file_yawning: 'yawning.mp3',
+  local_audio_file_drowsy_yawning: 'drowsy_yawning.mp3',
+  local_audio_min_interval: 3.0,
   save_event_video: true,
   save_event_image: true,
   event_video_duration: 10,
@@ -688,6 +774,7 @@ const inferenceAutoStart = ref(false)
 const inferenceStatusLoading = ref(false)
 const inferenceActionLoading = ref(false)
 const inferenceConfigLoading = ref(false)
+let previewAudioPlayer = null
 
 // RGB 和 Hex 转换
 const rgbToHex = (r, g, b) => {
@@ -816,6 +903,10 @@ onMounted(async () => {
 onUnmounted(() => {
   if (statusCheckInterval) {
     clearInterval(statusCheckInterval)
+  }
+  if (previewAudioPlayer) {
+    previewAudioPlayer.pause()
+    previewAudioPlayer = null
   }
 })
 
@@ -1044,6 +1135,30 @@ const loadAlarmConfig = async () => {
     }
     if (res.data.sound_light_alarm_enabled !== undefined) {
       alarmForm.value.sound_light_alarm_enabled = res.data.sound_light_alarm_enabled
+    }
+    if (res.data.local_audio_alarm_enabled !== undefined) {
+      alarmForm.value.local_audio_alarm_enabled = res.data.local_audio_alarm_enabled
+    }
+    if (res.data.local_audio_volume !== undefined) {
+      alarmForm.value.local_audio_volume = Number(res.data.local_audio_volume)
+    }
+    if (res.data.local_audio_device !== undefined) {
+      alarmForm.value.local_audio_device = res.data.local_audio_device
+    }
+    if (res.data.local_audio_file_offpost !== undefined) {
+      alarmForm.value.local_audio_file_offpost = res.data.local_audio_file_offpost
+    }
+    if (res.data.local_audio_file_drowsy !== undefined) {
+      alarmForm.value.local_audio_file_drowsy = res.data.local_audio_file_drowsy
+    }
+    if (res.data.local_audio_file_yawning !== undefined) {
+      alarmForm.value.local_audio_file_yawning = res.data.local_audio_file_yawning
+    }
+    if (res.data.local_audio_file_drowsy_yawning !== undefined) {
+      alarmForm.value.local_audio_file_drowsy_yawning = res.data.local_audio_file_drowsy_yawning
+    }
+    if (res.data.local_audio_min_interval !== undefined) {
+      alarmForm.value.local_audio_min_interval = Number(res.data.local_audio_min_interval)
     }
     if (res.data.save_event_video !== undefined) {
       alarmForm.value.save_event_video = res.data.save_event_video
@@ -1472,16 +1587,68 @@ const selectEventSavePath = async () => {
   }
 }
 
+const previewAlarmAudio = async (fileName) => {
+  const safeFile = String(fileName || '').trim()
+  if (!safeFile) {
+    ElMessage.warning('请先填写音频文件名')
+    return
+  }
+  try {
+    if (previewAudioPlayer) {
+      previewAudioPlayer.pause()
+      previewAudioPlayer = null
+    }
+    const url = `/api/audio/preview?file=${encodeURIComponent(safeFile)}`
+    previewAudioPlayer = new Audio(url)
+    previewAudioPlayer.currentTime = 0
+    await previewAudioPlayer.play()
+    ElMessage.success(`正在试听: ${safeFile}`)
+  } catch (error) {
+    console.error('试听音频失败:', error)
+    ElMessage.error(`试听失败，请确认 audio/${safeFile} 存在且可播放`)
+  }
+}
+
 const applyAlarm = async () => {
   alarmLoading.value = true
   try {
     const payload = {
       popup_alarm_enabled: alarmForm.value.popup_alarm_enabled,
       sound_light_alarm_enabled: alarmForm.value.sound_light_alarm_enabled,
+      local_audio_alarm_enabled: alarmForm.value.local_audio_alarm_enabled,
+      local_audio_volume: Number(alarmForm.value.local_audio_volume || 0),
+      local_audio_device: String(alarmForm.value.local_audio_device || '').trim(),
+      local_audio_file_offpost: String(alarmForm.value.local_audio_file_offpost || '').trim(),
+      local_audio_file_drowsy: String(alarmForm.value.local_audio_file_drowsy || '').trim(),
+      local_audio_file_yawning: String(alarmForm.value.local_audio_file_yawning || '').trim(),
+      local_audio_file_drowsy_yawning: String(alarmForm.value.local_audio_file_drowsy_yawning || '').trim(),
+      local_audio_min_interval: Number(alarmForm.value.local_audio_min_interval || 0),
       save_event_video: alarmForm.value.save_event_video,
       save_event_image: alarmForm.value.save_event_image,
       event_video_duration: alarmForm.value.event_video_duration,
       event_save_path: alarmForm.value.event_save_path
+    }
+    if (!payload.local_audio_device) {
+      ElMessage.warning('本地音频设备不能为空')
+      alarmLoading.value = false
+      return
+    }
+    if (payload.local_audio_volume < 0 || payload.local_audio_volume > 100) {
+      ElMessage.warning('本地播报音量必须在0-100之间')
+      alarmLoading.value = false
+      return
+    }
+    if (isDrowsyMode.value) {
+      if (!payload.local_audio_file_drowsy || !payload.local_audio_file_yawning || !payload.local_audio_file_drowsy_yawning) {
+        ElMessage.warning('请完整填写瞌睡模式音频文件名')
+        alarmLoading.value = false
+        return
+      }
+    }
+    if (isOffpostMode.value && !payload.local_audio_file_offpost) {
+      ElMessage.warning('请填写离岗模式音频文件名')
+      alarmLoading.value = false
+      return
     }
     if (isOffpostMode.value) {
       payload.offpost_absence_duration = alarmForm.value.offpost_absence_duration
