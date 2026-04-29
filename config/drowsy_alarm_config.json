@@ -6,6 +6,7 @@
   "once_per_id": false,
   "popup_alarm_enabled": false,
   "sound_light_alarm_enabled": false,
+  "camera_offline_alarm_enabled": false,
   "local_audio_alarm_enabled": true,
   "local_audio_volume": 80,
   "local_audio_device": "hw:0,0",
@@ -16,11 +17,11 @@
   "local_audio_min_interval": 3.0,
   "save_event_video": false,
   "save_event_image": false,
-  "event_video_duration": 10,
+  "event_video_duration": 5,
   "event_video_pre_seconds": 5.0,
   "event_save_path": "/home/yzkj/abnormal-behavior-monitoring/alarm_events",
   "drowsy_ear_threshold": 0.2,
   "drowsy_mar_threshold": 0.6,
-  "drowsy_eye_frames_threshold": 20,
-  "drowsy_yawn_frames_threshold": 12
+  "drowsy_eye_frames_threshold": 15,
+  "drowsy_yawn_frames_threshold": 9
 }

@@ -6,6 +6,7 @@
   "once_per_id": false,
   "popup_alarm_enabled": false,
   "sound_light_alarm_enabled": false,
+  "camera_offline_alarm_enabled": true,
   "save_event_video": false,
   "save_event_image": false,
   "event_video_duration": 5,

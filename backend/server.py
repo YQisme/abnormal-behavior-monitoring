@@ -148,6 +148,7 @@ alarm_config = {
     "once_per_id": False,  # 相同ID是否只报警一次（True=整个生命周期只报警一次，False=允许重复报警）
     "popup_alarm_enabled": True,  # 是否开启弹窗报警
     "sound_light_alarm_enabled": True,  # 是否开启声光报警（通过MQTT下发）
+    "camera_offline_alarm_enabled": True,  # 是否开启摄像头离线报警
     "local_audio_alarm_enabled": True,  # 是否开启本地扬声器播报（后端直接调用 aplay）
     "local_audio_volume": 80,  # 本地播报音量（0-100）
     "local_audio_device": "hw:0,0",  # 本地扬声器 ALSA 设备
@@ -473,6 +474,10 @@ def trigger_camera_offline_alarm(ip):
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     alarm_key = f"camera_offline_{ip}"
     
+    # 支持单独关闭摄像头离线报警
+    if not alarm_config.get('camera_offline_alarm_enabled', True):
+        return False
+
     # 使用防抖时间机制，避免频繁报警
     debounce_time = alarm_config.get('debounce_time', 5.0)
     if alarm_key in camera_offline_alarm_triggered:
@@ -984,6 +989,7 @@ def load_alarm_config(profile=None):
         "once_per_id": False,
         "popup_alarm_enabled": True,
         "sound_light_alarm_enabled": True,
+        "camera_offline_alarm_enabled": True,
         "local_audio_alarm_enabled": True,
         "local_audio_volume": 80,
         "local_audio_device": "hw:0,0",
@@ -1021,6 +1027,8 @@ def load_alarm_config(profile=None):
                     alarm_config['popup_alarm_enabled'] = bool(config['popup_alarm_enabled'])
                 if 'sound_light_alarm_enabled' in config:
                     alarm_config['sound_light_alarm_enabled'] = bool(config['sound_light_alarm_enabled'])
+                if 'camera_offline_alarm_enabled' in config:
+                    alarm_config['camera_offline_alarm_enabled'] = bool(config['camera_offline_alarm_enabled'])
                 if 'local_audio_alarm_enabled' in config:
                     alarm_config['local_audio_alarm_enabled'] = bool(config['local_audio_alarm_enabled'])
                 if 'local_audio_volume' in config:
@@ -4716,6 +4724,9 @@ def set_alarm_config():
 
         if 'sound_light_alarm_enabled' in data:
             alarm_config['sound_light_alarm_enabled'] = bool(data['sound_light_alarm_enabled'])
+
+        if 'camera_offline_alarm_enabled' in data:
+            alarm_config['camera_offline_alarm_enabled'] = bool(data['camera_offline_alarm_enabled'])
 
         if 'local_audio_alarm_enabled' in data:
             alarm_config['local_audio_alarm_enabled'] = bool(data['local_audio_alarm_enabled'])

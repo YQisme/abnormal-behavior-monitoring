@@ -511,6 +511,12 @@
               开启后执行声光报警动作（屏幕闪红并语音播报）
             </span>
           </el-form-item>
+          <el-form-item label="摄像头离线报警">
+            <el-switch v-model="alarmForm.camera_offline_alarm_enabled" />
+            <span style="margin-left: 10px; color: #666; font-size: 12px">
+              关闭后摄像头断线时不触发离线报警事件
+            </span>
+          </el-form-item>
           <el-form-item label="后端本地播报">
             <el-switch v-model="alarmForm.local_audio_alarm_enabled" />
             <span style="margin-left: 10px; color: #666; font-size: 12px">
@@ -728,6 +734,7 @@ const alarmForm = ref({
   once_per_id: false,
   popup_alarm_enabled: true,
   sound_light_alarm_enabled: true,
+  camera_offline_alarm_enabled: true,
   local_audio_alarm_enabled: true,
   local_audio_volume: 80,
   local_audio_device: 'hw:0,0',
@@ -1135,6 +1142,9 @@ const loadAlarmConfig = async () => {
     }
     if (res.data.sound_light_alarm_enabled !== undefined) {
       alarmForm.value.sound_light_alarm_enabled = res.data.sound_light_alarm_enabled
+    }
+    if (res.data.camera_offline_alarm_enabled !== undefined) {
+      alarmForm.value.camera_offline_alarm_enabled = res.data.camera_offline_alarm_enabled
     }
     if (res.data.local_audio_alarm_enabled !== undefined) {
       alarmForm.value.local_audio_alarm_enabled = res.data.local_audio_alarm_enabled
@@ -1615,6 +1625,7 @@ const applyAlarm = async () => {
     const payload = {
       popup_alarm_enabled: alarmForm.value.popup_alarm_enabled,
       sound_light_alarm_enabled: alarmForm.value.sound_light_alarm_enabled,
+      camera_offline_alarm_enabled: alarmForm.value.camera_offline_alarm_enabled,
       local_audio_alarm_enabled: alarmForm.value.local_audio_alarm_enabled,
       local_audio_volume: Number(alarmForm.value.local_audio_volume || 0),
       local_audio_device: String(alarmForm.value.local_audio_device || '').trim(),
