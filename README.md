@@ -4,6 +4,10 @@
 
 核心能力：三种监测模式（区域报警 / 离岗监测 / 瞌睡监测）、按模式独立配置与推理控制、多档案管理、MQTT 推送、视频录制、摄像头状态与画面遮挡检测、报警事件中心、本地语音播报等。
 
+<img width="760" height="407" alt="效果图1" src="https://github.com/user-attachments/assets/d4838d60-1509-4e6e-83a5-98eccfcd85bd" />
+
+<img width="1821" height="895" alt="效果图2" src="https://github.com/user-attachments/assets/90d80b3e-1ab5-407e-a188-bd9084485034" />
+
 ## 功能特性
 
 - **三模式监测**：区域报警、离岗监测、瞌睡监测；配置 / 推理 / 日志按模式隔离
